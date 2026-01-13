@@ -1863,11 +1863,14 @@ class CddlTypes(NamedTuple):
 class CodeGenerator(CddlXcoder):
     """Class for generating C code that encode/decodes CBOR and validates it according to the CDDL.
     """
-    def __init__(self, mode, entry_type_names, default_bit_size, *args, **kwargs):
+    def __init__(self, mode, entry_type_names, default_bit_size, repeated_as_pointers,
+                 stream_encode_functions, *args, **kwargs):
         super(CodeGenerator, self).__init__(*args, **kwargs)
         self.mode = mode
         self.entry_type_names = entry_type_names
         self.default_bit_size = default_bit_size
+        self.repeated_as_pointers = repeated_as_pointers
+        self.stream_encode_functions = stream_encode_functions
 
     @classmethod
     def from_cddl(cddl_class, mode, *args, **kwargs):
@@ -1890,7 +1893,14 @@ class CodeGenerator(CddlXcoder):
         return res
 
     def init_args(self):
-        return (self.mode, self.entry_type_names, self.default_bit_size, self.default_max_qty)
+        return (
+            self.mode,
+            self.entry_type_names,
+            self.default_bit_size,
+            self.repeated_as_pointers,
+            self.stream_encode_functions,
+            self.default_max_qty,
+        )
 
     def delegate_type_condition(self):
         """Whether to use the C type of the first child as this type's C type"""
@@ -2046,8 +2056,12 @@ class CodeGenerator(CddlXcoder):
                 f"Expected single var: {var_type!r}"
             if not anonymous or var_type[-1][-1] != "}":
                 var_name = self.var_name()
-                array_part = f"[{self.max_qty}]" if full and self.max_qty != 1 else ""
-                var_type[-1] += f" {var_name}{array_part}"
+                if full and self.max_qty != 1 and self.repeated_as_pointers:
+                    # Repeated fields become pointer + *_count (caller-owned storage).
+                    var_type[-1] += f" *{var_name}"
+                else:
+                    array_part = f"[{self.max_qty}]" if full and self.max_qty != 1 else ""
+                    var_type[-1] += f" {var_name}{array_part}"
             var_type = add_semicolon(var_type)
         return var_type
 
@@ -2346,6 +2360,30 @@ class CodeGenerator(CddlXcoder):
         """Make a string from the list returned by single_func_prim()"""
         return xcode_statement(*self.single_func_prim(self.val_access(), union_int))
 
+    def xcode_tstr_stream_chunks(self):
+        if self.mode != "encode" or not self.stream_encode_functions:
+            return None
+        if self.value is not None or self.key is not None or self.cbor:
+            return None
+        if self.count_var_condition():
+            return None
+
+        prov_name = self.var_name(with_prefix=True, observe_skipped=False) + "_tstr_chunks"
+        prov_access = "((const struct cbor_stream_providers *)zcbor_get_stream_providers(state))"
+        has_prov = f"({prov_access} && {prov_access}->{prov_name}.next_chunk)"
+        stream_call = (
+            f"zcbor_tstr_encode_indefinite_chunks(state, "
+            f"{prov_access}->{prov_name}.next_chunk, {prov_access}->{prov_name}.ctx)"
+        )
+        return f"({has_prov} ? ({stream_call}) : ({self.xcode_single_func_prim()}))"
+
+    def xcode_tstr(self):
+        """Encode TSTR, with optional streaming chunk provider support."""
+        stream_chunks = self.xcode_tstr_stream_chunks()
+        if stream_chunks is not None:
+            return stream_chunks
+        return self.xcode_single_func_prim()
+
     def list_counts(self):
         """Recursively sum the total minimum and maximum element count for this element."""
         retval = ({
@@ -2385,9 +2423,18 @@ class CodeGenerator(CddlXcoder):
             "zcbor_map_end_decode", "zcbor_map_end_encode"]
         assert self.type in ["LIST", "MAP"], \
             "Expected LIST or MAP type, was %s." % self.type
-        _, max_counts = zip(
-            *(child.list_counts() for child in self.value)) if self.value else ((0,), (0,))
-        count_arg = f', {str(sum(max_counts))}' if self.mode == 'encode' else ''
+
+        # Default: definite-length. When generating streaming encode entrypoints, use
+        # indefinite-length containers.
+        if self.mode == 'encode' and self.stream_encode_functions:
+            count_arg = ', ZCBOR_VALUE_IS_INDEFINITE_LENGTH'
+        elif self.mode == 'encode':
+            _, max_counts = zip(
+                *(child.list_counts() for child in self.value)) if self.value else ((0,), (0,))
+            count_arg = f', {str(sum(max_counts))}'
+        else:
+            count_arg = ''
+
         with_children = "(%s && ((%s) || (%s, false)) && %s)" % (
             f"{start_func}(state{count_arg})",
             f"{newl_ind}&& ".join(child.full_xcode() for child in self.value),
@@ -2447,7 +2494,27 @@ class CodeGenerator(CddlXcoder):
                 [child.enum_var_name() for child in self.value],
                 [child.full_xcode() for child in self.value])
 
+    def xcode_bstr_stream_chunks(self):
+        if self.mode != "encode" or not self.stream_encode_functions:
+            return None
+        if self.value is not None or self.key is not None or self.cbor:
+            return None
+        if self.count_var_condition():
+            return None
+
+        prov_name = self.var_name(with_prefix=True, observe_skipped=False) + "_bstr_chunks"
+        prov_access = "((const struct cbor_stream_providers *)zcbor_get_stream_providers(state))"
+        has_prov = f"({prov_access} && {prov_access}->{prov_name}.next_chunk)"
+        stream_call = (
+            f"zcbor_bstr_encode_indefinite_chunks(state, "
+            f"{prov_access}->{prov_name}.next_chunk, {prov_access}->{prov_name}.ctx)"
+        )
+        return f"({has_prov} ? ({stream_call}) : ({self.xcode_single_func_prim()}))"
+
     def xcode_bstr(self):
+        stream_chunks = self.xcode_bstr_stream_chunks()
+        if stream_chunks is not None:
+            return stream_chunks
         if self.cbor and not self.cbor.is_entry_type():
             access_arg = f', {deref_if_not_null(self.val_access())}' if self.mode == 'decode' \
                 else ''
@@ -2544,7 +2611,7 @@ class CodeGenerator(CddlXcoder):
             "NINT": lambda: self.xcode_single_func_prim(val_union_int),
             "FLOAT": self.xcode_single_func_prim,
             "BSTR": self.xcode_bstr,
-            "TSTR": self.xcode_single_func_prim,
+            "TSTR": self.xcode_tstr,
             "BOOL": self.xcode_single_func_prim,
             "NIL": self.xcode_single_func_prim,
             "UNDEF": self.xcode_single_func_prim,
@@ -2603,10 +2670,36 @@ class CodeGenerator(CddlXcoder):
 
             minmax = "_minmax" if self.mode == "encode" else ""
             mode = self.mode
+
+            # Keep encode max_qty overrideable (streaming write entrypoints only) when the CDDL
+            # omitted a max and we fell back to --default-max-qty.
+            if self.mode == "encode" and self.stream_encode_functions and self.max_qty == self.default_max_qty:
+                max_qty = "DEFAULT_MAX_QTY"
+            else:
+                max_qty = self.max_qty
+
+            # Optional streaming encode: provider iterator overrides pointer+count.
+            if self.mode == "encode" and self.stream_encode_functions:
+                prov_name = self.var_name(with_prefix=True, observe_skipped=False)
+                prov_access = f"((const struct cbor_stream_providers *)zcbor_get_stream_providers(state))"
+                has_prov = f"({prov_access} && {prov_access}->{prov_name}.next)"
+                iter_call = (
+                    f"zcbor_multi_encode_iter_minmax({self.min_qty}, {max_qty}, "
+                    f"(zcbor_encoder_t *){func}, state, {prov_access}->{prov_name}.next, "
+                    f"{prov_access}->{prov_name}.ctx)"
+                )
+                ptr_call = (
+                    f"zcbor_multi_{mode}{minmax}({self.min_qty}, {max_qty}, &{self.count_var_access()}, "
+                    f"(zcbor_{mode}r_t *){func}, "
+                    f"{xcode_args('*' + arg if arg != 'NULL' and self.result_len() != '0' else arg)}, "
+                    f"{self.result_len()})"
+                )
+                return f"({has_prov} ? ({iter_call}) : ({ptr_call}))"
+
             return (
                 f"zcbor_multi_{mode}{minmax}(%s, %s, &%s, (zcbor_{mode}r_t *)%s, %s, %s)" %
                 (self.min_qty,
-                 self.max_qty,
+                 max_qty,
                  self.count_var_access(),
                  func,
                  xcode_args("*" + arg if arg != "NULL" and self.result_len() != "0" else arg),
@@ -2652,10 +2745,12 @@ int cbor_{self.xcode_func_name()}(
 
 
 class CodeRenderer():
-    def __init__(self, entry_types, modes, print_time, default_max_qty, git_sha='', file_header=''):
+    def __init__(self, entry_types, modes, print_time, default_max_qty, git_sha='', file_header='',
+                 stream_encode_functions=False):
         self.entry_types = entry_types
         self.print_time = print_time
         self.default_max_qty = default_max_qty
+        self.stream_encode_functions = stream_encode_functions
 
         self.sorted_types = dict()
         self.functions = dict()
@@ -2838,7 +2933,7 @@ do { \\
 #include "{header_file_name}"
 #include "zcbor_print.h"
 
-#if DEFAULT_MAX_QTY != {self.default_max_qty}
+#if {"ZCBOR_GENERATED_DEFAULT_MAX_QTY" if self.stream_encode_functions else "DEFAULT_MAX_QTY"} != {self.default_max_qty}
 #error "The type file was generated with a different default_max_qty than this file"
 #endif
 
@@ -2849,10 +2944,40 @@ do { \\
 {linesep.join([self.render_function(xcoder, mode) for xcoder in self.functions[mode]])}
 
 {linesep.join([self.render_entry_function(xcoder, mode) for xcoder in self.entry_types[mode]])}
+
+{self.render_write_impls(mode) if self.stream_encode_functions and mode == "encode" else ""}
 """
+
+    def render_write_impls(self, mode):
+        if mode != "encode":
+            return ""
+        return (linesep * 2).join([
+            f"""int cbor_stream_encode_{xcoder.var_name(with_prefix=True, observe_skipped=False)}(
+\t\tzcbor_stream_write_fn stream_write, void *stream_user_data,
+\t\tconst {xcoder.type_name() if struct_ptr_name(mode) in xcoder.full_xcode() else "void"} *input,
+\t\tconst struct cbor_stream_providers *prov,
+\t\tsize_t *bytes_written_out)
+{{
+\tzcbor_state_t states[8];
+\tzcbor_new_encode_state_streaming(states, sizeof(states) / sizeof(states[0]),
+\t\tstream_write, stream_user_data, 1);
+\tzcbor_set_stream_providers(&states[0], prov);
+\tbool ok = {xcoder.xcode_func_name()}(&states[0], input);
+\tif (!ok) {{
+\t\tint err = zcbor_pop_error(&states[0]);
+\t\treturn (err == ZCBOR_SUCCESS) ? ZCBOR_ERR_UNKNOWN : err;
+\t}}
+\tif (bytes_written_out) {{
+\t\t*bytes_written_out = zcbor_stream_bytes_written(&states[0]);
+\t}}
+\treturn ZCBOR_SUCCESS;
+}}"""
+            for xcoder in self.entry_types[mode]
+        ])
 
     def render_h_file(self, type_def_file, header_guard, mode):
         """Render the entire generated header file contents."""
+        write_includes = '#include "zcbor_encode.h"' if (self.stream_encode_functions and mode == "encode") else ""
         return \
             f"""/*{self.render_file_header(" *")}
  */
@@ -2864,17 +2989,22 @@ do { \\
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
+{write_includes}
 #include "{type_def_file}"
 
 #ifdef __cplusplus
 extern "C" {{
 #endif
 
-#if DEFAULT_MAX_QTY != {self.default_max_qty}
+#if {"ZCBOR_GENERATED_DEFAULT_MAX_QTY" if self.stream_encode_functions else "DEFAULT_MAX_QTY"} != {self.default_max_qty}
 #error "The type file was generated with a different default_max_qty than this file"
 #endif
 
 {(linesep * 2).join([f"{xcoder.public_xcode_func_sig()};" for xcoder in self.entry_types[mode]])}
+
+{self.render_write_types(mode) if self.stream_encode_functions and mode == "encode" else ""}
+
+{self.render_write_decls(mode) if self.stream_encode_functions and mode == "encode" else ""}
 
 
 #ifdef __cplusplus
@@ -2883,6 +3013,108 @@ extern "C" {{
 
 #endif /* {header_guard} */
 """
+
+    def render_write_types(self, mode):
+        if mode != "encode":
+            return ""
+        repeats, tstrs, bstrs = self.collect_stream_provider_names()
+
+        repeat_fields = linesep.join([f"\tstruct zcbor_iter_provider {name};" for name in repeats]) or "\t/* no repeated providers */"
+        tstr_fields = linesep.join([f"\tstruct zcbor_tstr_chunk_provider {name};" for name in tstrs]) or "\t/* no tstr providers */"
+        bstr_fields = linesep.join([f"\tstruct zcbor_bstr_chunk_provider {name};" for name in bstrs]) or "\t/* no bstr providers */"
+
+        return f"""/* Streaming encode helpers (generated by zcbor.py --stream-encode-functions) */
+struct zcbor_iter_provider {{
+	void *ctx;
+	zcbor_repeat_next_fn next;
+}};
+
+struct zcbor_tstr_chunk_provider {{
+	void *ctx;
+	zcbor_next_chunk_fn next_chunk;
+}};
+
+struct zcbor_bstr_chunk_provider {{
+	void *ctx;
+	zcbor_next_chunk_fn next_chunk;
+}};
+
+/* Global provider struct (schema-wide). */
+struct cbor_stream_providers {{
+	/* Repeated fields */
+{repeat_fields}
+
+	/* Text string fields */
+{tstr_fields}
+
+	/* Byte string fields */
+{bstr_fields}
+}};"""
+
+    def collect_stream_provider_names(self):
+        """Collect provider field names for the whole schema (encode side only).
+
+        These names are stable, unique (with_prefix=True), and map directly to the
+        var_name() used in generated encode code.
+        """
+        repeats = set()
+        tstrs = set()
+        bstrs = set()
+
+        visited = set()
+
+        def walk(elem):
+            # Avoid infinite recursion on self-referential types.
+            if id(elem) in visited:
+                return
+            visited.add(id(elem))
+
+            if elem.count_var_condition():
+                repeats.add(elem.var_name(with_prefix=True, observe_skipped=False))
+
+            # Variable (non-literal) tstr values. Exclude map keys and fixed values.
+            # Don't generate *_chunks for repeated string elements; chunk providers apply to a
+            # single string value, not each element of a repeated list.
+            if (not elem.count_var_condition()
+                    and elem.type == "TSTR" and elem.value is None and elem.key is None and not elem.cbor):
+                tstrs.add(elem.var_name(with_prefix=True, observe_skipped=False) + "_tstr_chunks")
+
+            # Variable (non-literal) bstr values. Exclude map keys and CBOR-encoded bstrs.
+            if (not elem.count_var_condition()
+                    and elem.type == "BSTR" and elem.value is None and elem.key is None and not elem.cbor):
+                bstrs.add(elem.var_name(with_prefix=True, observe_skipped=False) + "_bstr_chunks")
+
+            if elem.type in ["LIST", "MAP", "GROUP", "UNION"]:
+                for child in elem.value:
+                    walk(child)
+
+            if elem.cbor:
+                walk(elem.cbor)
+
+            if elem.key:
+                walk(elem.key)
+
+            # Follow named types.
+            if elem.type == "OTHER" and elem.value in elem.my_types:
+                walk(elem.my_types[elem.value])
+
+        # Walk from all top-level types; this makes provider struct schema-wide.
+        for root in self.sorted_types["encode"]:
+            walk(root)
+
+        return (sorted(repeats), sorted(tstrs), sorted(bstrs))
+
+    def render_write_decls(self, mode):
+        if mode != "encode":
+            return ""
+        return (linesep * 2).join([
+            f"""int cbor_stream_encode_{xcoder.var_name(with_prefix=True, observe_skipped=False)}(
+		zcbor_stream_write_fn stream_write, void *stream_user_data,
+		const {xcoder.type_name() if struct_ptr_name(mode) in xcoder.full_xcode() else "void"} *input,
+		const struct cbor_stream_providers *prov,
+		size_t *bytes_written_out);"""
+            for xcoder in self.entry_types[mode]
+        ])
 
     def render_type_file(self, header_guard, mode):
         body = (
@@ -2912,7 +3144,13 @@ extern "C" {{
  *
  *  See `zcbor --help` for more information about --default-max-qty
  */
-#define DEFAULT_MAX_QTY {self.default_max_qty}
+{("#define ZCBOR_GENERATED_DEFAULT_MAX_QTY " + str(self.default_max_qty) + linesep
+  + linesep
+  + "/* Allow build-system override. */" + linesep
+  + "#ifndef DEFAULT_MAX_QTY" + linesep
+  + "#define DEFAULT_MAX_QTY ZCBOR_GENERATED_DEFAULT_MAX_QTY" + linesep
+  + "#endif")
+ if self.stream_encode_functions else ("#define DEFAULT_MAX_QTY " + str(self.default_max_qty))}
 
 {body}
 
@@ -3044,6 +3282,22 @@ The default_max_qty can usually be set to a text symbol if desired,
 to allow it to be configurable when building the code. This is not always
 possible, as sometimes the value is needed for internal computations.
 If so, the script will raise an exception.""")
+    code_parser.add_argument(
+        "--repeated-as-pointers", required=False, action="store_true", default=False,
+        help="""Represent repeated fields (max_qty > 1) as pointer + count instead of embedding a
+fixed-size array in the generated types.
+
+This can significantly reduce the size of top-level unions/structs at the cost of requiring the
+caller to provide storage for decode, and a readable array for encode.""")
+    code_parser.add_argument(
+        "--stream-encode-functions", required=False,
+        action="store_true", default=False, dest="stream_encode_functions",
+        help="""Also generate streaming encode entrypoints (cbor_stream_encode_<type>) for each entry type.
+These use zcbor_new_encode_state_streaming() and are intended for low-RAM UART write paths.
+
+Streaming encode entrypoints support:
+  - repeated fields via zcbor_multi_encode_iter_minmax() (iterator callback)
+  - tstr fields via zcbor_tstr_encode_indefinite_chunks() (chunk iterator)""")
     code_parser.add_argument(
         "--output-c", "--oc", required=False, type=str,
         help="""Path to output C file. If both --decode and --encode are specified, _decode and
@@ -3213,7 +3467,8 @@ def process_code(args):
     for mode in modes:
         cddl_res[mode] = CodeGenerator.from_cddl(
             mode, cddl_contents, args.default_max_qty, mode, args.entry_types,
-            args.default_bit_size, short_names=args.short_names)
+            args.default_bit_size, args.repeated_as_pointers, args.stream_encode_functions,
+            short_names=args.short_names)
 
     # Parsing is done, pretty print the result.
     verbose_print(args.verbose, "Parsed CDDL types:")
@@ -3268,7 +3523,8 @@ def process_code(args):
                                          for entry in args.entry_types] for mode in modes},
                             modes=modes, print_time=args.time_header,
                             default_max_qty=args.default_max_qty, git_sha=git_sha,
-                            file_header=args.file_header
+                            file_header=args.file_header,
+                            stream_encode_functions=args.stream_encode_functions
                             )
 
     c_code_dir = C_SRC_PATH
