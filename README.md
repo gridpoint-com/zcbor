@@ -196,6 +196,23 @@ The tests require [Zephyr](https://github.com/zephyrproject-rtos/zephyr) (if you
 
 The generated C code is C++ compatible.
 
+Streaming encode entrypoints
+----------------------------
+
+For encode-heavy, low-RAM paths, `zcbor code` can optionally generate streaming encode entrypoints:
+
+- `cbor_stream_encode_<type>(zcbor_stream_write_fn stream_write, void *stream_user_data, const <type> *input, const struct cbor_stream_providers *prov, size_t *bytes_written_out)`
+
+Enable them with `--stream-encode-functions`.
+
+These entrypoints write CBOR via the supplied callback (no output buffer), and can stream:
+
+- repeated fields via iterator callbacks in `struct cbor_stream_providers`
+- `bstr` values via chunk callbacks (indefinite-length byte strings)
+- `tstr` values via chunk callbacks (indefinite-length text strings)
+
+When streaming entrypoints are enabled, generated encode code uses indefinite-length containers where needed.
+
 Build system
 ------------
 
@@ -436,7 +453,8 @@ zcbor code --help
 
 ```
 usage: zcbor code [-h] -c CDDL [--no-prelude] [-v]
-                  [--default-max-qty DEFAULT_MAX_QTY] [--output-c OUTPUT_C]
+                  [--default-max-qty DEFAULT_MAX_QTY] [--repeated-as-pointers]
+                  [--stream-encode-functions] [--output-c OUTPUT_C]
                   [--output-h OUTPUT_H] [--output-h-types OUTPUT_H_TYPES]
                   [--copy-sources] [--output-cmake OUTPUT_CMAKE] -t
                   ENTRY_TYPES [ENTRY_TYPES ...] [-d] [-e] [--time-header]
@@ -477,6 +495,13 @@ options:
                         as sometimes the value is needed for internal
                         computations. If so, the script will raise an
                         exception.
+  --repeated-as-pointers
+                        Represent repeated fields (max_qty > 1) as pointer +
+                        count instead of embedding fixed-size arrays in the
+                        generated types.
+  --stream-encode-functions
+                        Also generate streaming encode entrypoints
+                        (cbor_stream_encode_<type>) for each entry type.
   --output-c OUTPUT_C, --oc OUTPUT_C
                         Path to output C file. If both --decode and --encode
                         are specified, _decode and _encode will be appended to

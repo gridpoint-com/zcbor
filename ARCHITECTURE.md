@@ -175,6 +175,8 @@ There are up to 4 files constructed:
 - The H file with all the struct definitions (the type file). If both decoding and encoding files are generated for the same CDDL, they can share the same type file.
 - An optional cmake file for building the generated code together with the zcbor C libraries.
 
+When `zcbor code` is invoked with `--stream-encode-functions`, CodeRenderer also emits streaming encode entrypoints (`cbor_stream_encode_<type>`) and the associated provider structs used to supply repeated elements and chunked `tstr` values.
+
 CodeRenderer conducts some pruning and deduplication of the list of types and functions received from CodeGenerator.
 
 
