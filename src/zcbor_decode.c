@@ -584,6 +584,72 @@ bool zcbor_is_last_fragment(const struct zcbor_string_fragment *fragment)
 }
 
 
+static bool str_decode_chunks(zcbor_state_t *state, zcbor_stream_chunk_in call, void *ctx,
+		zcbor_major_type_t exp_major_type)
+{
+	INITIAL_CHECKS_WITH_TYPE(exp_major_type);
+	zcbor_assert_state(call != NULL, "chunk callback cannot be NULL.\r\n");
+
+	bool indefinite_length = false;
+	size_t str_len = 0;
+
+	if (!value_extract(state, &str_len, exp_major_type, &indefinite_length)) {
+		ZCBOR_FAIL();
+	}
+
+	if (!indefinite_length) {
+		ZCBOR_ERR_IF(state->payload + str_len > state->payload_end, ZCBOR_ERR_NO_PAYLOAD);
+		if (!call(ctx, state->payload, str_len)) {
+			ZCBOR_FAIL();
+		}
+		state->payload += str_len;
+		return true;
+	}
+
+	while (true) {
+		ZCBOR_ERR_IF(state->payload >= state->payload_end, ZCBOR_ERR_NO_PAYLOAD);
+
+		if (*state->payload == 0xFF) {
+			state->payload++;
+			break;
+		}
+
+		uint8_t chunk_header = *state->payload;
+		ZCBOR_ERR_IF(ZCBOR_MAJOR_TYPE(chunk_header) != exp_major_type, ZCBOR_ERR_WRONG_TYPE);
+
+		uint8_t additional = ZCBOR_ADDITIONAL(chunk_header);
+		ZCBOR_ERR_IF(additional == ZCBOR_VALUE_IS_INDEFINITE_LENGTH,
+			ZCBOR_ERR_ADDITIONAL_INVAL);
+		ZCBOR_ERR_IF(additional > ZCBOR_VALUE_IS_8_BYTES, ZCBOR_ERR_ADDITIONAL_INVAL);
+
+		size_t len_len = additional_len(additional);
+		ZCBOR_ERR_IF((state->payload + 1 + len_len) > state->payload_end,
+			ZCBOR_ERR_NO_PAYLOAD);
+
+		uint64_t chunk_len = 0;
+		if (len_len == 0) {
+			chunk_len = additional;
+		} else {
+			uint8_t *chunk_ptr = (uint8_t *)&chunk_len;
+			memset(chunk_ptr, 0, sizeof(chunk_len));
+			endian_copy(chunk_ptr + ZCBOR_ECPY_OFFS(sizeof(chunk_len), len_len),
+				state->payload + 1, len_len);
+		}
+
+		state->payload += 1 + len_len;
+		ZCBOR_ERR_IF((size_t)chunk_len > (size_t)(state->payload_end - state->payload),
+			ZCBOR_ERR_NO_PAYLOAD);
+
+		if (!call(ctx, state->payload, (size_t)chunk_len)) {
+			ZCBOR_FAIL();
+		}
+
+		state->payload += (size_t)chunk_len;
+	}
+
+	return true;
+}
+
 static bool str_decode(zcbor_state_t *state, struct zcbor_string *result,
 		zcbor_major_type_t exp_major_type)
 {
@@ -629,6 +695,12 @@ bool zcbor_bstr_decode(zcbor_state_t *state, struct zcbor_string *result)
 	return str_decode(state, result, ZCBOR_MAJOR_TYPE_BSTR);
 }
 
+bool zcbor_bstr_chunk_in(zcbor_state_t *state, zcbor_stream_chunk_in call, void *ctx)
+{
+	PRINT_FUNC();
+	return str_decode_chunks(state, call, ctx, ZCBOR_MAJOR_TYPE_BSTR);
+}
+
 
 bool zcbor_bstr_decode_fragment(zcbor_state_t *state, struct zcbor_string_fragment *result)
 {
@@ -648,6 +720,12 @@ bool zcbor_tstr_decode(zcbor_state_t *state, struct zcbor_string *result)
 {
 	PRINT_FUNC();
 	return str_decode(state, result, ZCBOR_MAJOR_TYPE_TSTR);
+}
+
+bool zcbor_tstr_chunk_in(zcbor_state_t *state, zcbor_stream_chunk_in call, void *ctx)
+{
+	PRINT_FUNC();
+	return str_decode_chunks(state, call, ctx, ZCBOR_MAJOR_TYPE_TSTR);
 }
 
 

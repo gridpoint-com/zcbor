@@ -152,7 +152,60 @@ struct zcbor_state_constant {
 #ifdef ZCBOR_MAP_SMART_SEARCH
 	uint8_t *map_search_elem_state_end; /**< The end of the @ref map_search_elem_state buffer. */
 #endif
+	size_t (*stream_write)(void *user_data, const uint8_t *data, size_t len);
+	void *stream_user_data;
+	size_t stream_bytes_written;  /**< Total bytes written in streaming mode. */
+
+	const void *stream_io;
+
 };
+
+#ifndef ZCBOR_STREAM_IO_HELPERS
+#define ZCBOR_STREAM_IO_HELPERS
+static inline void zcbor_set_stream_io(zcbor_state_t *state, const void *io)
+{
+	if (state && state->constant_state) {
+		state->constant_state->stream_io = io;
+	}
+}
+
+static inline const void *zcbor_get_stream_io(const zcbor_state_t *state)
+{
+	return (state && state->constant_state) ? state->constant_state->stream_io : NULL;
+}
+#endif
+
+/* Alignment helper for state storage. */
+#if defined(__cplusplus) && (__cplusplus >= 201103L)
+#define ZCBOR_ALIGNAS(type) alignas(type)
+#define ZCBOR_ALIGNOF(type) alignof(type)
+#define ZCBOR_STATIC_ASSERT(cond, msg) static_assert((cond), msg)
+#elif defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
+#define ZCBOR_ALIGNAS(type) _Alignas(type)
+#define ZCBOR_ALIGNOF(type) _Alignof(type)
+#define ZCBOR_STATIC_ASSERT(cond, msg) _Static_assert((cond), msg)
+#else
+/* Require GCC extensions when C11/C++11 alignment is unavailable. */
+#if defined(__GNUC__)
+#define ZCBOR_ALIGNAS(type) __attribute__((aligned(__alignof__(type))))
+#define ZCBOR_ALIGNOF(type) __alignof__(type)
+#define ZCBOR_STATIC_ASSERT(cond, msg) _Static_assert((cond), msg)
+#else
+#error "Unsupported compiler: zcbor requires alignment and static assertion support."
+#endif
+#endif
+
+/* We store struct zcbor_state_constant in state storage that is aligned as
+ * zcbor_state_t. Ensure that is sufficient for the constant state object.
+ */
+ZCBOR_STATIC_ASSERT((ZCBOR_ALIGNOF(zcbor_state_t) >= ZCBOR_ALIGNOF(struct zcbor_state_constant)),
+	"zcbor_state_t alignment must be >= zcbor_state_constant alignment.");
+
+/** Number of zcbor_state_t slots required to store a struct zcbor_state_constant
+ *  object at the end of the state array.
+ */
+#define ZCBOR_CONST_STATE_SLOTS \
+	((sizeof(struct zcbor_state_constant) + sizeof(zcbor_state_t) - 1) / sizeof(zcbor_state_t))
 
 #ifdef ZCBOR_CANONICAL
 #define ZCBOR_ENFORCE_CANONICAL_DEFAULT true
@@ -285,6 +338,8 @@ do { \
 #define ZCBOR_ERR_MAP_FLAGS_NOT_AVAILABLE 20
 #define ZCBOR_ERR_INVALID_VALUE_ENCODING 21 ///! When ZCBOR_CANONICAL is defined, and the incoming data is not encoded with minimal length, or uses indefinite length array.
 #define ZCBOR_ERR_CONSTANT_STATE_MISSING 22
+#define ZCBOR_ERR_STREAM_WRITE_FAILED 23 ///! Streaming callback returned error or wrote fewer bytes than requested
+#define ZCBOR_ERR_STREAM_READ_FAILED 24 ///! Streaming provider callback returned error or invalid data
 #define ZCBOR_ERR_UNKNOWN 31
 
 /** The largest possible elem_count. */

@@ -44,10 +44,15 @@ void zcbor_new_decode_state(zcbor_state_t *state_array, size_t n_states,
  *                            including elements in nested unordered maps.
  */
 #define ZCBOR_STATE_D(name, num_backups, payload, payload_size, elem_count, n_flags) \
-zcbor_state_t name[((num_backups) + 2 + ZCBOR_FLAG_STATES(n_flags))]; \
+ZCBOR_ALIGNAS(zcbor_state_t) uint8_t name##_storage[ \
+	(((num_backups) + 1 + ZCBOR_FLAG_STATES(n_flags) + ZCBOR_CONST_STATE_SLOTS) * sizeof(zcbor_state_t)) \
+]; \
+zcbor_state_t *name = (zcbor_state_t *)name##_storage; \
 do { \
-	zcbor_new_decode_state(name, ZCBOR_ARRAY_SIZE(name), payload, payload_size, elem_count, \
-			(uint8_t *)&name[(num_backups) + 1], ZCBOR_FLAG_STATES(n_flags) * sizeof(zcbor_state_t)); \
+	zcbor_new_decode_state(name, ((num_backups) + 1 + ZCBOR_FLAG_STATES(n_flags) + ZCBOR_CONST_STATE_SLOTS), \
+			payload, payload_size, elem_count, \
+			(uint8_t *)&name[(num_backups) + 1], \
+			ZCBOR_FLAG_STATES(n_flags) * sizeof(zcbor_state_t)); \
 } while(0)
 
 
@@ -73,6 +78,10 @@ bool zcbor_uint_decode(zcbor_state_t *state, void *result, size_t result_size); 
 bool zcbor_bstr_decode(zcbor_state_t *state, struct zcbor_string *result); /* bstr */
 bool zcbor_tstr_decode(zcbor_state_t *state, struct zcbor_string *result); /* tstr */
 bool zcbor_tag_decode(zcbor_state_t *state, uint32_t *result);  /* CBOR tag */
+
+typedef bool (*zcbor_stream_chunk_in)(void *ctx, const uint8_t *data, size_t len);
+bool zcbor_tstr_chunk_in(zcbor_state_t *state, zcbor_stream_chunk_in call, void *ctx);
+bool zcbor_bstr_chunk_in(zcbor_state_t *state, zcbor_stream_chunk_in call, void *ctx);
 bool zcbor_bool_decode(zcbor_state_t *state, bool *result); /* boolean CBOR simple value */
 bool zcbor_float16_decode(zcbor_state_t *state, float *result); /* IEEE754 float16 */
 bool zcbor_float16_bytes_decode(zcbor_state_t *state, uint16_t *result); /* IEEE754 float16 raw bytes */

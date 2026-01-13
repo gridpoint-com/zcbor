@@ -40,9 +40,13 @@ void zcbor_new_encode_state(zcbor_state_t *state_array, size_t n_states,
  *  @param[in]  elem_count    The starting elem_count (typically 1).
  */
 #define ZCBOR_STATE_E(name, num_backups, payload, payload_size, elem_count) \
-zcbor_state_t name[((num_backups) + 2)]; \
+ZCBOR_ALIGNAS(zcbor_state_t) uint8_t name##_storage[ \
+	(((num_backups) + 1 + ZCBOR_CONST_STATE_SLOTS) * sizeof(zcbor_state_t)) \
+]; \
+zcbor_state_t *name = (zcbor_state_t *)name##_storage; \
 do { \
-	zcbor_new_encode_state(name, ZCBOR_ARRAY_SIZE(name), payload, payload_size, elem_count); \
+	zcbor_new_encode_state(name, ((num_backups) + 1 + ZCBOR_CONST_STATE_SLOTS), \
+			payload, payload_size, elem_count); \
 } while(0)
 
 
@@ -188,6 +192,29 @@ bool zcbor_multi_encode_minmax(size_t min_encode, size_t max_encode,
 		const size_t *num_encode, zcbor_encoder_t encoder,
 		zcbor_state_t *state, const void *input, size_t input_len);
 
+/**
+ * @brief Iterator callback for streaming encode of repeated fields.
+ *
+ * Return values:
+ *  -  1: produced one element, stored at *elem_out
+ *  -  0: done (normal end)
+ *  - <0: error (negative errno-style)
+ *
+ * The pointer stored in *elem_out must remain valid until the next call to next()
+ * (or until encoding is finished), whichever comes first.
+ */
+typedef int (*zcbor_stream_iter)(void *ctx, const void **elem_out);
+
+/**
+ * @brief Encode a repeated field by iterating elements from a callback.
+ *
+ * This is intended for streaming encode where the caller does not want (or
+ * cannot afford) to materialize an array + count upfront.
+ */
+bool zcbor_multi_encode_iter_minmax(size_t min_encode, size_t max_encode,
+		zcbor_encoder_t encoder, zcbor_state_t *state,
+		zcbor_stream_iter next, void *ctx);
+
 
 /* Supplementary string (bstr/tstr) encoding functions: */
 
@@ -230,6 +257,74 @@ bool zcbor_bstr_start_encode(zcbor_state_t *state);
  * Restore element count from backup.
  */
 bool zcbor_bstr_end_encode(zcbor_state_t *state, struct zcbor_string *result);
+
+/**
+ * @brief Chunk iterator for streaming encode of indefinite-length text/byte strings.
+ *
+ * Return values:
+ *  -  1: produced one chunk (*ptr, *len)
+ *  -  0: done (normal end)
+ *  - <0: error (negative errno-style)
+ */
+typedef int (*zcbor_next_chunk_fn)(void *ctx, const uint8_t **ptr, size_t *len);
+
+/* Encode an indefinite-length tstr using a chunk iterator. */
+bool zcbor_tstr_encode_indefinite_chunks(zcbor_state_t *state,
+		zcbor_next_chunk_fn next_chunk, void *ctx);
+bool zcbor_bstr_encode_indefinite_chunks(zcbor_state_t *state,
+		zcbor_next_chunk_fn next_chunk, void *ctx);
+
+/**
+ * @brief Push callback for streaming encode of indefinite-length text/byte strings.
+ *
+ * The callback should emit 0 or more chunks using zcbor_*str_encode_chunk(),
+ * and return true on success.
+ */
+typedef bool (*zcbor_stream_chunk_out)(void *ctx, zcbor_state_t *state);
+
+/* Indefinite-length tstr/bstr using a chunk callback. */
+bool zcbor_tstr_chunk_out(zcbor_state_t *state,
+		zcbor_stream_chunk_out call, void *ctx);
+bool zcbor_bstr_chunk_out(zcbor_state_t *state,
+		zcbor_stream_chunk_out call, void *ctx);
+
+/* Push-oriented helpers for indefinite-length tstr/bstr. */
+bool zcbor_tstr_start_encode_indefinite(zcbor_state_t *state);
+bool zcbor_bstr_start_encode_indefinite(zcbor_state_t *state);
+bool zcbor_tstr_encode_chunk(zcbor_state_t *state, const uint8_t *ptr, size_t len);
+bool zcbor_bstr_encode_chunk(zcbor_state_t *state, const uint8_t *ptr, size_t len);
+bool zcbor_tstr_end_encode_indefinite(zcbor_state_t *state);
+bool zcbor_bstr_end_encode_indefinite(zcbor_state_t *state);
+
+/** Stream write callback type.
+ *
+ * @param user_data User-provided context (e.g., UART device pointer)
+ * @param data Pointer to data to write
+ * @param len Number of bytes to write
+ * @return Number of bytes written (must equal len for success)
+ */
+typedef size_t (*zcbor_stream_write_fn)(void *user_data, const uint8_t *data, size_t len);
+
+/** Initialize encoding state for streaming mode.
+ *
+ * Bytes are written directly via the callback instead of buffering.
+ * In streaming mode, arrays and maps use indefinite-length encoding
+ * (0x9F/0xBF + items + 0xFF) to avoid backtracking.
+ *
+ * @param state_array Array of states (must have at least 2 elements for constant_state)
+ * @param n_states Number of states in array
+ * @param stream_write Callback function to write bytes
+ * @param stream_user_data User data passed to callback (e.g., UART device pointer)
+ * @param elem_count Starting element count (typically 1)
+ */
+void zcbor_new_encode_state_streaming(zcbor_state_t *state_array, size_t n_states,
+		zcbor_stream_write_fn stream_write, void *stream_user_data, size_t elem_count);
+
+size_t zcbor_stream_bytes_written(const zcbor_state_t *state);
+
+int zcbor_stream_entry_function(void *input, zcbor_state_t *states, size_t n_states,
+		zcbor_encoder_t func, zcbor_stream_write_fn stream_write, void *stream_user_data,
+		size_t elem_count, size_t *bytes_written_out);
 
 #ifdef __cplusplus
 }
