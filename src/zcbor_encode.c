@@ -15,6 +15,43 @@
 _Static_assert((sizeof(size_t) == sizeof(void *)),
 	"This code needs size_t to be the same length as pointers.");
 
+#define ZCBOR_IS_STREAMING(state) ((state)->constant_state && (state)->constant_state->stream_write)
+
+#define ZCBOR_WRITE_BYTE(state, byte) \
+	do { \
+		if (ZCBOR_IS_STREAMING(state)) { \
+			uint8_t b = (byte); \
+			int ret = state->constant_state->stream_write( \
+				state->constant_state->stream_user_data, &b, 1); \
+			if (ret != 1) { \
+				ZCBOR_ERR(ZCBOR_ERR_STREAM_WRITE_FAILED); \
+			} \
+			state->constant_state->stream_bytes_written++; \
+		} else { \
+			ZCBOR_CHECK_PAYLOAD(); \
+			*(state->payload_mut) = (byte); \
+			state->payload_mut++; \
+		} \
+	} while(0)
+
+#define ZCBOR_WRITE_BYTES(state, data, len) \
+	do { \
+		if (ZCBOR_IS_STREAMING(state)) { \
+			int ret = state->constant_state->stream_write( \
+				state->constant_state->stream_user_data, (data), (len)); \
+			if (ret != (int)(len)) { \
+				ZCBOR_ERR(ZCBOR_ERR_STREAM_WRITE_FAILED); \
+			} \
+			state->constant_state->stream_bytes_written += (len); \
+		} else { \
+			if ((state->payload + (len)) > state->payload_end) { \
+				ZCBOR_ERR(ZCBOR_ERR_NO_PAYLOAD); \
+			} \
+			memcpy(state->payload_mut, (data), (len)); \
+			state->payload_mut += (len); \
+		} \
+	} while(0)
+
 
 static uint8_t log2ceil(size_t val)
 {
@@ -44,13 +81,11 @@ static bool encode_header_byte(zcbor_state_t *state,
 	zcbor_major_type_t major_type, uint8_t additional)
 {
 	ZCBOR_CHECK_ERROR();
-	ZCBOR_CHECK_PAYLOAD();
 
 	zcbor_assert_state(additional < 32, "Unsupported additional value: %d\r\n", additional);
 
-	*(state->payload_mut) = (uint8_t)((major_type << 5) | (additional & 0x1F));
+	ZCBOR_WRITE_BYTE(state, (uint8_t)((major_type << 5) | (additional & 0x1F)));
 	zcbor_trace(state, "value_encode");
-	state->payload_mut++;
 	return true;
 }
 
@@ -62,21 +97,16 @@ static bool value_encode_len(zcbor_state_t *state, zcbor_major_type_t major_type
 {
 	uint8_t *u8_result  = (uint8_t *)result;
 
-	if ((state->payload + 1 + result_len) > state->payload_end) {
-		ZCBOR_ERR(ZCBOR_ERR_NO_PAYLOAD);
-	}
-
 	if (!encode_header_byte(state, major_type,
 				get_additional(result_len, u8_result[0]))) {
 		ZCBOR_FAIL();
 	}
 
 #ifdef ZCBOR_BIG_ENDIAN
-	memcpy(state->payload_mut, u8_result, result_len);
-	state->payload_mut += result_len;
+	ZCBOR_WRITE_BYTES(state, u8_result, result_len);
 #else
 	for (; result_len > 0; result_len--) {
-		*(state->payload_mut++) = u8_result[result_len - 1];
+		ZCBOR_WRITE_BYTE(state, u8_result[result_len - 1]);
 	}
 #endif /* ZCBOR_BIG_ENDIAN */
 
@@ -211,10 +241,12 @@ bool zcbor_size_encode(zcbor_state_t *state, const size_t *input)
 static bool str_start_encode(zcbor_state_t *state,
 		const struct zcbor_string *input, zcbor_major_type_t major_type)
 {
-	if (input->value && ((zcbor_header_len_ptr(&input->len, sizeof(input->len))
-			+ input->len + (size_t)state->payload)
-			> (size_t)state->payload_end)) {
-		ZCBOR_ERR(ZCBOR_ERR_NO_PAYLOAD);
+	if (!ZCBOR_IS_STREAMING(state)) {
+		if (input->value && ((zcbor_header_len_ptr(&input->len, sizeof(input->len))
+				+ input->len + (size_t)state->payload)
+				> (size_t)state->payload_end)) {
+			ZCBOR_ERR(ZCBOR_ERR_NO_PAYLOAD);
+		}
 	}
 	if (!value_encode(state, major_type, &input->len, sizeof(input->len))) {
 		ZCBOR_FAIL();
@@ -270,19 +302,25 @@ bool zcbor_bstr_end_encode(zcbor_state_t *state, struct zcbor_string *result)
 static bool str_encode(zcbor_state_t *state,
 		const struct zcbor_string *input, zcbor_major_type_t major_type)
 {
-	ZCBOR_CHECK_PAYLOAD(); /* To make the size_t cast below safe. */
-	if (input->len > (size_t)(state->payload_end - state->payload)) {
-		ZCBOR_ERR(ZCBOR_ERR_NO_PAYLOAD);
+	if (!state->constant_state || !state->constant_state->stream_write) {
+		ZCBOR_CHECK_PAYLOAD(); /* To make the size_t cast below safe. */
+		if (input->len > (size_t)(state->payload_end - state->payload)) {
+			ZCBOR_ERR(ZCBOR_ERR_NO_PAYLOAD);
+		}
 	}
 	if (!str_start_encode(state, input, major_type)) {
 		ZCBOR_FAIL();
 	}
-	if (state->payload_mut != input->value) {
-		/* Use memmove since string might be encoded into the same space
+	if (state->constant_state && state->constant_state->stream_write) {
+		ZCBOR_WRITE_BYTES(state, input->value, input->len);
+	} else {
+		/* Buffer mode: use memmove since string might be encoded into the same space
 		 * because of bstrx_cbor_start_encode/bstrx_cbor_end_encode. */
-		memmove(state->payload_mut, input->value, input->len);
+		if (state->payload_mut != input->value) {
+			memmove(state->payload_mut, input->value, input->len);
+		}
+		state->payload += input->len;
 	}
-	state->payload += input->len;
 	return true;
 }
 
@@ -331,6 +369,14 @@ static bool list_map_start_encode(zcbor_state_t *state, size_t max_num,
 		zcbor_major_type_t major_type)
 {
 #ifdef ZCBOR_CANONICAL
+	/* In streaming mode, always use indefinite-length to avoid backtracking. */
+	if (state->constant_state && state->constant_state->stream_write) {
+		if (!encode_header_byte(state, major_type, ZCBOR_VALUE_IS_INDEFINITE_LENGTH)) {
+			ZCBOR_FAIL();
+		}
+		return true;
+	}
+
 	if (!zcbor_new_backup(state, 0)) {
 		ZCBOR_FAIL();
 	}
@@ -367,6 +413,14 @@ static bool list_map_end_encode(zcbor_state_t *state, size_t max_num,
 			zcbor_major_type_t major_type)
 {
 #ifdef ZCBOR_CANONICAL
+	/* In streaming mode, terminate indefinite-length containers with break (0xFF). */
+	if (state->constant_state && state->constant_state->stream_write) {
+		if (!encode_header_byte(state, ZCBOR_MAJOR_TYPE_SIMPLE, ZCBOR_VALUE_IS_INDEFINITE_LENGTH)) {
+			ZCBOR_FAIL();
+		}
+		return true;
+	}
+
 	size_t list_count = ((major_type == ZCBOR_MAJOR_TYPE_LIST) ?
 					state->elem_count
 					: (state->elem_count / 2));
@@ -581,6 +635,96 @@ bool zcbor_multi_encode_minmax(size_t min_encode, size_t max_encode,
 	}
 }
 
+bool zcbor_multi_encode_iter_minmax(size_t min_encode, size_t max_encode,
+		zcbor_encoder_t encoder, zcbor_state_t *state,
+		zcbor_repeat_next_fn next, void *ctx)
+{
+	ZCBOR_CHECK_ERROR();
+
+	if (!next) {
+		ZCBOR_ERR(ZCBOR_ERR_STREAM_READ_FAILED);
+	}
+
+	size_t count = 0;
+	for (; count < max_encode; count++) {
+		const void *elem = NULL;
+		int rc = next(ctx, &elem);
+		if (rc == 0) {
+			break; /* done */
+		}
+		if (rc < 0 || !elem) {
+			ZCBOR_ERR(ZCBOR_ERR_STREAM_READ_FAILED);
+		}
+
+		if (!encoder(state, elem)) {
+			ZCBOR_FAIL();
+		}
+	}
+
+	if (count < min_encode) {
+		ZCBOR_ERR(ZCBOR_ERR_ITERATIONS);
+	}
+
+	zcbor_log("Encoded %zu elements (iter).\n", count);
+	return true;
+}
+
+static bool encode_indefinite_chunks(zcbor_state_t *state, uint8_t major_type,
+		bool (*chunk_put)(zcbor_state_t *state, const struct zcbor_string *zs),
+		zcbor_next_chunk_fn next_chunk, void *ctx)
+{
+	ZCBOR_CHECK_ERROR();
+
+	if (!next_chunk || !chunk_put) {
+		ZCBOR_ERR(ZCBOR_ERR_STREAM_READ_FAILED);
+	}
+
+	/* Start indefinite-length container. */
+	if (!encode_header_byte(state, major_type, ZCBOR_VALUE_IS_INDEFINITE_LENGTH)) {
+		ZCBOR_FAIL();
+	}
+
+	while (true) {
+		const uint8_t *ptr = NULL;
+		size_t len = 0;
+		int rc = next_chunk(ctx, &ptr, &len);
+		if (rc == 0) {
+			break; /* done */
+		}
+		if (rc < 0 || (!ptr && len != 0)) {
+			ZCBOR_ERR(ZCBOR_ERR_STREAM_READ_FAILED);
+		}
+
+		const struct zcbor_string zs = { .value = ptr, .len = len };
+		if (!chunk_put(state, &zs)) {
+			ZCBOR_FAIL();
+		}
+	}
+
+	/* Break (0xFF). */
+	if (!encode_header_byte(state, ZCBOR_MAJOR_TYPE_SIMPLE, ZCBOR_VALUE_IS_INDEFINITE_LENGTH)) {
+		ZCBOR_FAIL();
+	}
+
+	return true;
+}
+
+bool zcbor_tstr_encode_indefinite_chunks(zcbor_state_t *state,
+		zcbor_next_chunk_fn next_chunk, void *ctx)
+{
+	return encode_indefinite_chunks(state, ZCBOR_MAJOR_TYPE_TSTR,
+			(bool (*)(zcbor_state_t *, const struct zcbor_string *))zcbor_tstr_encode,
+			next_chunk, ctx);
+}
+
+bool zcbor_bstr_encode_indefinite_chunks(zcbor_state_t *state,
+		zcbor_next_chunk_fn next_chunk, void *ctx)
+{
+	return encode_indefinite_chunks(state, ZCBOR_MAJOR_TYPE_BSTR,
+			(bool (*)(zcbor_state_t *, const struct zcbor_string *))zcbor_bstr_encode,
+			next_chunk, ctx);
+}
+
 
 bool zcbor_multi_encode(const size_t num_encode, zcbor_encoder_t encoder,
 		zcbor_state_t *state, const void *input, size_t result_len)
@@ -600,4 +744,46 @@ void zcbor_new_encode_state(zcbor_state_t *state_array, size_t n_states,
 		uint8_t *payload, size_t payload_len, size_t elem_count)
 {
 	zcbor_new_state(state_array, n_states, payload, payload_len, elem_count, NULL, 0);
+}
+
+void zcbor_new_encode_state_streaming(zcbor_state_t *state_array, size_t n_states,
+		zcbor_stream_write_fn stream_write, void *stream_user_data, size_t elem_count)
+{
+	/* Initialize with dummy buffer (not used in streaming mode) */
+	static uint8_t dummy_buffer[1];
+	zcbor_new_state(state_array, n_states, dummy_buffer, sizeof(dummy_buffer), elem_count, NULL, 0);
+
+	if (state_array[0].constant_state) {
+		state_array[0].constant_state->stream_write = stream_write;
+		state_array[0].constant_state->stream_user_data = stream_user_data;
+		state_array[0].constant_state->stream_bytes_written = 0;
+		state_array[0].constant_state->stream_providers = NULL;
+	}
+}
+
+size_t zcbor_stream_bytes_written(const zcbor_state_t *state)
+{
+	if (!state || !state->constant_state || !state->constant_state->stream_write) {
+		return 0;
+	}
+	return state->constant_state->stream_bytes_written;
+}
+
+int zcbor_stream_entry_function(void *input, zcbor_state_t *states, size_t n_states,
+		zcbor_encoder_t func, zcbor_stream_write_fn stream_write, void *stream_user_data,
+		size_t elem_count, size_t *bytes_written_out)
+{
+	zcbor_new_encode_state_streaming(states, n_states, stream_write, stream_user_data, elem_count);
+
+	bool ret = func(states, input);
+	if (!ret) {
+		int err = zcbor_pop_error(states);
+		err = (err == ZCBOR_SUCCESS) ? ZCBOR_ERR_UNKNOWN : err;
+		return err;
+	}
+
+	if (bytes_written_out) {
+		*bytes_written_out = zcbor_stream_bytes_written(&states[0]);
+	}
+	return ZCBOR_SUCCESS;
 }

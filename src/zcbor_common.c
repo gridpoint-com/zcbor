@@ -14,9 +14,6 @@
 _Static_assert((sizeof(size_t) == sizeof(void *)),
 	"This code needs size_t to be the same length as pointers.");
 
-_Static_assert((sizeof(zcbor_state_t) >= sizeof(struct zcbor_state_constant)),
-	"This code needs zcbor_state_t to be at least as large as zcbor_backups_t.");
-
 bool zcbor_new_backup(zcbor_state_t *state, size_t new_elem_count)
 {
 	ZCBOR_CHECK_ERROR();
@@ -150,14 +147,41 @@ void zcbor_new_state(zcbor_state_t *state_array, size_t n_states,
 #endif
 	state_array[0].constant_state = NULL;
 
-	if (n_states < 2) {
+	if (n_states < (1 + ZCBOR_CONST_STATE_SLOTS)) {
 		return;
 	}
 
-	/* Use the last state as a struct zcbor_state_constant object. */
-	state_array[0].constant_state = (struct zcbor_state_constant *)&state_array[n_states - 1];
+	/* Store the constant state object in the tail of the state array.
+	 *
+	 * The state array layout is:
+	 *   [0]                    : live state
+	 *   [1 .. backups]         : backups
+	 *   [.. optional flags ..] : map smart search scratch (decode only, if flags points into the array)
+	 *   [tail]                 : struct zcbor_state_constant (may span multiple slots)
+	 */
+	const size_t const_state_slots = ZCBOR_CONST_STATE_SLOTS;
+	const size_t const_state_idx = n_states - const_state_slots;
+
+	state_array[0].constant_state = (struct zcbor_state_constant *)&state_array[const_state_idx];
 	state_array[0].constant_state->backup_list = NULL;
-	state_array[0].constant_state->num_backups = n_states - 2;
+
+	/* Backups live in state_array[1..num_backups]. If flags points inside the array,
+	 * it indicates the start of the scratch region, and backups stop just before it.
+	 */
+	size_t backup_end_idx = const_state_idx - 1;
+	const uint8_t *const base = (const uint8_t *)state_array;
+	const uint8_t *const tail = (const uint8_t *)&state_array[const_state_idx];
+	if (flags) {
+		const uint8_t *const f = flags;
+		if ((f >= base) && (f < tail)) {
+			size_t flags_idx = (size_t)(f - base) / sizeof(zcbor_state_t);
+			if (flags_idx > 0) {
+				backup_end_idx = flags_idx - 1;
+			}
+		}
+	}
+
+	state_array[0].constant_state->num_backups = (backup_end_idx >= 1) ? backup_end_idx : 0;
 	state_array[0].constant_state->current_backup = 0;
 	state_array[0].constant_state->error = ZCBOR_SUCCESS;
 #ifdef ZCBOR_STOP_ON_ERROR
@@ -168,7 +192,11 @@ void zcbor_new_state(zcbor_state_t *state_array, size_t n_states,
 #ifdef ZCBOR_MAP_SMART_SEARCH
 	state_array[0].constant_state->map_search_elem_state_end = flags + flags_bytes;
 #endif
-	if (n_states > 2) {
+	state_array[0].constant_state->stream_write = NULL;
+	state_array[0].constant_state->stream_user_data = NULL;
+	state_array[0].constant_state->stream_bytes_written = 0;
+	state_array[0].constant_state->stream_providers = NULL;
+	if (state_array[0].constant_state->num_backups > 0) {
 		state_array[0].constant_state->backup_list = &state_array[1];
 	}
 }
