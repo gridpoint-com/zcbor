@@ -20,6 +20,10 @@ set(py_command
   ${bit_arg}
   )
 
+if (STREAMING)
+  list(APPEND py_command --stream-encode)
+endif()
+
 execute_process(
   COMMAND ${py_command}
   COMMAND_ERROR_IS_FATAL ANY
