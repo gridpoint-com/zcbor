@@ -10,7 +10,7 @@ python3 -m unittest test_zcbor test_repo_files
 [[ $? -ne 0 ]] && popd && exit 1
 popd
 
-if [[ -z "$ZEHPYR_BASE" ]]; then
+if [[ -z "$ZEPHYR_BASE" ]]; then
         ZEPHYR_BASE=$(west topdir)/zephyr
 fi
 
