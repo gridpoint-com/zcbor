@@ -13,6 +13,65 @@
 #endif
 #include <common_test.h>
 
+#ifdef STREAMING
+#include <string.h>
+#include <errno.h>
+
+struct stream_ctx {
+	uint8_t *buf;
+	size_t size;
+	size_t pos;
+};
+
+static int stream_write(void *user_data, const uint8_t *data, size_t len)
+{
+	struct stream_ctx *ctx = (struct stream_ctx *)user_data;
+
+	if (!ctx) {
+		return -1;
+	}
+	if (len == 0) {
+		return 0;
+	}
+	if (!data) {
+		return -1;
+	}
+	if (ctx->pos + len > ctx->size) {
+		return -1;
+	}
+
+	memcpy(&ctx->buf[ctx->pos], data, len);
+	ctx->pos += len;
+	return (int)len;
+}
+#endif /* STREAMING */
+
+#ifdef STREAMING
+struct bstr_chunk_ctx {
+	int idx;
+	const uint8_t *chunks[2];
+	size_t lens[2];
+};
+
+static int bstr_next_chunk(void *user_ctx, const uint8_t **ptr, size_t *len)
+{
+	struct bstr_chunk_ctx *c = (struct bstr_chunk_ctx *)user_ctx;
+
+	if (!c || !ptr || !len) {
+		return -EINVAL;
+	}
+
+	if (c->idx >= 2) {
+		return 0;
+	}
+
+	*ptr = c->chunks[c->idx];
+	*len = c->lens[c->idx];
+	c->idx++;
+	return 1;
+}
+#endif /* STREAMING */
+
 
 /* This test uses generated code to encode a 'Pet' instance. It populates the
  * generated struct, and runs the generated encoding function, then checks that
@@ -41,7 +100,19 @@ ZTEST(cbor_encode_test2, test_pet)
 	size_t out_len;
 
 	/* Check that encoding succeeded. */
+#ifdef STREAMING
+	struct stream_ctx ctx = {
+		.buf = output,
+		.size = sizeof(output),
+		.pos = 0,
+	};
+
+	int rc = cbor_stream_encode_Pet(stream_write, &ctx, &pet, NULL, &out_len);
+	zassert_equal(ZCBOR_SUCCESS, rc, NULL);
+	zassert_equal(out_len, ctx.pos, NULL);
+#else
 	zassert_equal(ZCBOR_SUCCESS, cbor_encode_Pet(output, sizeof(output), &pet, &out_len), NULL);
+#endif
 
 	/* Check that the resulting length is correct. */
 	zassert_equal(sizeof(exp_output), out_len, NULL);
@@ -59,7 +130,18 @@ ZTEST(cbor_encode_test2, test_pet)
 ZTEST(cbor_encode_test2, test_pet_raw)
 {
 	uint8_t payload[100] = {0};
+#ifdef STREAMING
+	struct stream_ctx ctx = {
+		.buf = payload,
+		.size = sizeof(payload),
+		.pos = 0,
+	};
+	zcbor_state_t states[4];
+	zcbor_new_encode_state_streaming(states, 4, stream_write, &ctx, 1);
+	zcbor_state_t *state = states;
+#else
 	ZCBOR_STATE_E(state, 4, payload, sizeof(payload), 1);
+#endif
 
 	uint8_t exp_output[] = {
 		LIST(3),
@@ -97,10 +179,69 @@ ZTEST(cbor_encode_test2, test_pet_raw)
 	/* Check that encoding succeeded. */
 	zassert_true(res, NULL);
 	/* Check that the resulting length is correct. */
+#ifdef STREAMING
+	zassert_equal(sizeof(exp_output), ctx.pos, "%d != %d\r\n",
+		sizeof(exp_output), ctx.pos);
+#else
 	zassert_equal(sizeof(exp_output), state->payload - payload, "%d != %d\r\n",
 		sizeof(exp_output), state->payload - payload);
+#endif
 	/* Check the payload contents. */
 	zassert_mem_equal(exp_output, payload, sizeof(exp_output), NULL);
 }
+
+#ifdef STREAMING
+ZTEST(cbor_encode_test2, test_bstr_indefinite_chunks)
+{
+	/* Expect: 0x5f (bstr indefinite), 0x43 01 02 03, 0x42 04 05, 0xff (break) */
+	uint8_t output[16];
+	struct stream_ctx ctx = {
+		.buf = output,
+		.size = sizeof(output),
+		.pos = 0,
+	};
+
+	const uint8_t c1[] = { 0x01, 0x02, 0x03 };
+	const uint8_t c2[] = { 0x04, 0x05 };
+	struct bstr_chunk_ctx chunks = {
+		.idx = 0,
+		.chunks = { c1, c2 },
+		.lens = { sizeof(c1), sizeof(c2) },
+	};
+
+	zcbor_state_t s[4];
+	zcbor_new_encode_state_streaming(s, 4, stream_write, &ctx, 1);
+
+	zassert_true(zcbor_bstr_encode_indefinite_chunks(s, bstr_next_chunk, &chunks), NULL);
+	zassert_equal(ctx.pos, 1 + 1 + sizeof(c1) + 1 + sizeof(c2) + 1, NULL);
+
+	const uint8_t exp[] = { 0x5f, 0x43, 0x01, 0x02, 0x03, 0x42, 0x04, 0x05, 0xff };
+	zassert_mem_equal(output, exp, ctx.pos, NULL);
+}
+#endif /* STREAMING */
+
+#ifdef STREAMING
+ZTEST(cbor_encode_test2, test_streaming_container_headers)
+{
+	/* In streaming mode, lists/maps must be indefinite-length (0x9f/0xbf ... 0xff). */
+	uint8_t output[32];
+	struct stream_ctx ctx = {
+		.buf = output,
+		.size = sizeof(output),
+		.pos = 0,
+	};
+
+	zcbor_state_t s[4];
+	zcbor_new_encode_state_streaming(s, 4, stream_write, &ctx, 1);
+
+	zassert_true(zcbor_list_start_encode(s, 3), NULL);
+	zassert_true(zcbor_uint32_put(s, 1), NULL);
+	zassert_true(zcbor_list_end_encode(s, 3), NULL);
+
+	zassert_true(ctx.pos >= 2, NULL);
+	zassert_equal(output[0], 0x9f, NULL);
+	zassert_equal(output[ctx.pos - 1], 0xff, NULL);
+}
+#endif /* STREAMING */
 
 ZTEST_SUITE(cbor_encode_test2, NULL, NULL, NULL, NULL, NULL);

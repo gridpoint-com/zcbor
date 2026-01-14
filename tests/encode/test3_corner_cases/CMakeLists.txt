@@ -59,6 +59,10 @@ set(py_command
   --short-names
   )
 
+if (STREAMING)
+  list(APPEND py_command --stream-encode-functions)
+endif()
+
 execute_process(
   COMMAND ${py_command}
   COMMAND_ERROR_IS_FATAL ANY

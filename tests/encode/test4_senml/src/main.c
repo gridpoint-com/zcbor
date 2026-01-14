@@ -12,6 +12,53 @@
 #endif
 #include <common_test.h>
 
+#ifdef STREAMING
+#include <string.h>
+
+struct stream_ctx {
+	uint8_t *buf;
+	size_t size;
+	size_t pos;
+};
+
+static int stream_write(void *user_data, const uint8_t *data, size_t len)
+{
+	struct stream_ctx *ctx = (struct stream_ctx *)user_data;
+
+	if (!ctx || !data) {
+		return -1;
+	}
+	if (len == 0) {
+		return 0;
+	}
+	if (ctx->pos + len > ctx->size) {
+		return -1;
+	}
+
+	memcpy(&ctx->buf[ctx->pos], data, len);
+	ctx->pos += len;
+	return (int)len;
+}
+
+static int stream_encode_lwm2m_senml(uint8_t *payload, size_t payload_len,
+		struct lwm2m_senml *input, size_t *out_len)
+{
+	struct stream_ctx ctx = {
+		.buf = payload,
+		.size = payload_len,
+		.pos = 0,
+	};
+	int rc = cbor_stream_encode_lwm2m_senml(stream_write, &ctx, input, NULL, out_len);
+
+	if (rc == ZCBOR_SUCCESS) {
+		zassert_equal(*out_len, ctx.pos, NULL);
+	}
+	return rc;
+}
+
+#define cbor_encode_lwm2m_senml stream_encode_lwm2m_senml
+#endif /* STREAMING */
+
 ZTEST(cbor_encode_test4, test_senml)
 {
 	struct lwm2m_senml input = {
