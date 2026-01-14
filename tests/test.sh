@@ -5,7 +5,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-pushd "scripts"
+pushd "tests/scripts"
 python3 -m unittest test_zcbor test_repo_files
 [[ $? -ne 0 ]] && popd && exit 1
 popd
