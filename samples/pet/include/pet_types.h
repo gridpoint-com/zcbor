@@ -27,7 +27,17 @@ extern "C" {
  *
  *  See `zcbor --help` for more information about --default-max-qty
  */
-#define DEFAULT_MAX_QTY 3
+#define ZCBOR_GENERATED_DEFAULT_MAX_QTY 3
+
+/* Allow build-system override. */
+#ifndef DEFAULT_MAX_QTY
+#define DEFAULT_MAX_QTY ZCBOR_GENERATED_DEFAULT_MAX_QTY
+#endif
+
+/* Allow build-system override for streaming state array size. */
+#ifndef ZCBOR_STREAM_STATE_ARRAY_SIZE
+#define ZCBOR_STREAM_STATE_ARRAY_SIZE 8
+#endif
 
 struct Pet {
 	struct zcbor_string names[3];

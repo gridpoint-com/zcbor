@@ -14,6 +14,7 @@ if (REGENERATE_ZCBOR)
     zcbor code # Invoke code generation
     --decode --encode # Generate both encoding and decoding code
     --short-names # Attempt to make generated symbol names shorter (at the risk of collision)
+    --stream-encode # Generate streaming encode entrypoints
     -c ${CMAKE_CURRENT_LIST_DIR}/../../tests/cases/pet.cddl # Generate code for the data structures in pet.cddl
     -t Pet # Create a public API for decoding/encoding the "Pet" type from pet.cddl
     --output-cmake ${CMAKE_CURRENT_LIST_DIR}/pet.cmake # The generated cmake file will be placed here

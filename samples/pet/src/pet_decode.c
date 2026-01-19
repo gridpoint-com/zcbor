@@ -16,7 +16,7 @@
 #include "pet_decode.h"
 #include "zcbor_print.h"
 
-#if DEFAULT_MAX_QTY != 3
+#if ZCBOR_GENERATED_DEFAULT_MAX_QTY != 3
 #error "The type file was generated with a different default_max_qty than this file"
 #endif
 
@@ -28,6 +28,8 @@
 		zcbor_log("%s success\r\n", func); \
 	} \
 } while(0)
+
+
 
 static bool decode_Pet(zcbor_state_t *state, struct Pet *result);
 
@@ -55,14 +57,12 @@ static bool decode_Pet(
 	return res;
 }
 
-
-
 int cbor_decode_Pet(
 		const uint8_t *payload, size_t payload_len,
 		struct Pet *result,
 		size_t *payload_len_out)
 {
-	zcbor_state_t states[4];
+	zcbor_state_t states[3 + ZCBOR_CONST_STATE_SLOTS];
 
 	return zcbor_entry_function(payload, payload_len, (void *)result, payload_len_out, states,
 		(zcbor_decoder_t *)decode_Pet, sizeof(states) / sizeof(zcbor_state_t), 1);
