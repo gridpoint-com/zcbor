@@ -372,3 +372,17 @@ OptList = [
 	optlist_int: int,
 	?optlist: [uint],
 ]
+
+collision_foo = 2
+
+CollisionList = [
+	collision_foo: uint,
+]
+
+CollisionMap = {
+	collision_foo: uint,
+}
+
+CollisionTypedKeyMap = {
+	collision_foo => uint,
+}

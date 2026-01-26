@@ -215,7 +215,7 @@ class CddlParser:
     - For "GROUP" and "UNION" types, there is no separate data item for the instance.
     """
     def __init__(self, default_max_qty, my_types, my_control_groups, base_name=None,
-                 short_names=False, base_stem=''):
+                 short_names=False, base_stem='', in_map=False):
         self.id_prefix = "temp_" + str(counter())
         self.id_num = None  # Unique ID number. Only populated if needed.
         # The value of the data item. Has different meaning for different
@@ -263,6 +263,7 @@ class CddlParser:
         # Stem which can be used when generating an id.
         self.base_stem = base_stem.replace("-", "_")
         self.short_names = short_names
+        self.in_map = in_map
 
         if type(self) not in type(self).cddl_regexes:
             self.cddl_regexes_init()
@@ -438,7 +439,7 @@ class CddlParser:
         """Return the kwargs that should be used to initialize a new instance of this class."""
         return {
             "my_types": self.my_types, "my_control_groups": self.my_control_groups,
-            "short_names": self.short_names}
+            "short_names": self.short_names, "in_map": self.in_map}
 
     def set_id_prefix(self, id_prefix=''):
         self.id_prefix = id_prefix
@@ -708,7 +709,7 @@ class CddlParser:
         map. This code uses a slightly different method for choosing between label and key.
         If the string is recognized as a type, it is treated as a key. For use during CDDL parsing.
         """
-        if key_or_label in self.my_types:
+        if self.in_map and key_or_label in self.my_types:
             self.set_key(self.parse(key_or_label)[0])
             assert self.key.type == "OTHER", "This should only be able to produce an OTHER key."
             if self.label is None:
@@ -785,13 +786,13 @@ class CddlParser:
         range_types = [
             (r'(?P<bracket>\[(?P<item>(?>[^[\]]+|(?&bracket))*)\])',
              lambda m_self, list_str: m_self.type_and_value(
-                 "LIST", lambda: m_self.parse(list_str))),
+                 "LIST", lambda: m_self.parse(list_str, in_map=False))),
             (r'(?P<paren>\((?P<item>(?>[^\(\)]+|(?&paren))*)\))',
              lambda m_self, group_str: m_self.type_and_value(
-                 "GROUP", lambda: m_self.parse(group_str))),
+                 "GROUP", lambda: m_self.parse(group_str, in_map=m_self.in_map))),
             (r'(?P<curly>{(?P<item>(?>[^{}]+|(?&curly))*)})',
              lambda m_self, map_str: m_self.type_and_value(
-                 "MAP", lambda: m_self.parse(map_str))),
+                 "MAP", lambda: m_self.parse(map_str, in_map=True))),
             (r'\'(?P<item>.*?)(?<!\\)\'',
              lambda m_self, string: m_self.type_and_value("BSTR", lambda: string)),
             (r'\"(?P<item>.*?)(?<!\\)\"',
@@ -1005,12 +1006,16 @@ class CddlParser:
             if c.type != "UINT" or c.value is None or c.value < 0:
                 raise TypeError("control group members must be literal positive integers.")
 
-    def parse(self, instr):
+    def parse(self, instr, in_map=None):
         """Parses entire instr and returns a list of instances."""
+        if in_map is None:
+            in_map = self.in_map
         instr = instr.strip()
         values = []
         while instr != '':
-            value = type(self)(*self.init_args(), **self.init_kwargs(), base_stem=self.base_stem)
+            kwargs = self.init_kwargs()
+            kwargs["in_map"] = in_map
+            value = type(self)(*self.init_args(), **kwargs, base_stem=self.base_stem)
             instr = value.get_value(instr)
             values.append(value)
         return values
