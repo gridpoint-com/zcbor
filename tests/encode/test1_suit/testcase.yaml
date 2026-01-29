@@ -7,3 +7,12 @@ tests:
       - qemu_malta/qemu_malta/be
     tags: zcbor encode canonical test1
     extra_args: CANONICAL=CANONICAL
+
+  zcbor.encode.test1_suit.streaming_canonical:
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+      - mps2/an521/cpu0
+      - qemu_malta/qemu_malta/be
+    tags: zcbor encode streaming canonical test1
+    extra_args: STREAMING=1 CANONICAL=CANONICAL

@@ -39,6 +39,7 @@ There are samples in the [samples](samples) directory that demonstrate different
 
 1. The [hello_world sample](samples/hello_world/README.md) is a minimum examples of encoding and decoding using the C library.
 2. The [pet sample](samples/pet/README.md) shows a how to use the C library together with generated code, and how to use the script tool to do code generation and data conversion.
+3. The [streaming_chunks sample](samples/streaming_chunks/README.md) shows how to use streaming encode and decode entrypoints with chunk callbacks.
 
 The [tests](tests) also demonstrate how to use zcbor in different ways. The [encoding](tests/encode), [decoding](tests/decode), and [unit](tests/unit) tests run using [Zephyr](https://github.com/zephyrproject-rtos/zephyr) (the samples do not use Zephyr).
 
@@ -195,6 +196,34 @@ There are tests for the code generation in [tests/decode](tests/decode) and [tes
 The tests require [Zephyr](https://github.com/zephyrproject-rtos/zephyr) (if your system is set up to build Zephyr samples, the tests should also build).
 
 The generated C code is C++ compatible.
+
+Streaming encode/decode entrypoints
+-----------------------------------
+
+For low-RAM paths, `zcbor code` can optionally generate streaming encode and decode entrypoints:
+
+- Encode: `cbor_stream_encode_<type>(zcbor_stream_write_fn stream_write, void *stream_user_data, const <type> *input, const struct cbor_stream_io_<type> *prov, size_t *bytes_written_out)`
+- Decode: `cbor_stream_decode_<type>(const uint8_t *payload, size_t payload_len, <type> *result, const struct cbor_stream_io_<type> *prov, size_t *payload_len_out)`
+
+Enable them with `--stream-encode` and `--stream-decode`.
+
+Streaming encode entrypoints write CBOR via the supplied callback (no output buffer), and can stream:
+
+- the `zcbor_stream_write_fn` callback signature is:
+  `size_t (*)(void *user_data, const uint8_t *data, size_t len)` and should return
+  the number of bytes written (must equal `len` for success)
+- repeated fields via iterator callbacks in `struct cbor_stream_io_<type>`
+- `bstr`/`tstr` values via chunk callbacks (use `chunks_out_*` fields) that emit chunks into the encoder
+
+Streaming decode entrypoints let you consume `bstr`/`tstr` chunks without reassembly:
+
+- the `zcbor_stream_chunk_in` callback signature is:
+  `bool (*)(void *ctx, const uint8_t *data, size_t len)`
+- chunk callbacks live in `struct cbor_stream_io_<type>` (use `chunks_in_*` fields)
+- when chunk io is present, the generated decode logic calls
+  `zcbor_tstr_chunk_in()` / `zcbor_bstr_chunk_in()` instead of
+  decoding into a single contiguous buffer, so the corresponding `zcbor_string`
+  field is not populated and the callback is responsible for capturing data
 
 Build system
 ------------
@@ -436,7 +465,8 @@ zcbor code --help
 
 ```
 usage: zcbor code [-h] -c CDDL [--no-prelude] [-v]
-                  [--default-max-qty DEFAULT_MAX_QTY] [--output-c OUTPUT_C]
+                  [--default-max-qty DEFAULT_MAX_QTY] [--repeated-as-pointers]
+                  [--stream-encode] [--stream-decode] [--output-c OUTPUT_C]
                   [--output-h OUTPUT_H] [--output-h-types OUTPUT_H_TYPES]
                   [--copy-sources] [--output-cmake OUTPUT_CMAKE]
                   -t ENTRY_TYPES [ENTRY_TYPES ...] [-d] [-e] [--time-header]
@@ -477,6 +507,25 @@ options:
                         as sometimes the value is needed for internal
                         computations. If so, the script will raise an
                         exception.
+  --repeated-as-pointers
+                        Represent repeated fields (max_qty > 1) as pointer +
+                        count instead of embedding a fixed-size array in the
+                        generated types. This can significantly reduce the
+                        size of top-level unions/structs at the cost of
+                        requiring the caller to provide storage for decode,
+                        and a readable array for encode.
+  --stream-encode       Also generate streaming encode entrypoints
+                        (cbor_stream_encode_<type>) for each entry type. These
+                        use zcbor_new_encode_state_streaming() and are
+                        intended for low-RAM UART write paths. Streaming
+                        encode entrypoints support: - repeated fields via
+                        zcbor_multi_encode_iter_minmax() (iterator callback) -
+                        tstr/bstr fields via chunk callbacks
+  --stream-decode       Also generate streaming decode entrypoints
+                        (cbor_stream_decode_<type>) for each entry type. These
+                        use zcbor_tstr_chunk_in()/zcbor_bstr_chunk_in()
+                        callbacks and allow indefinite-length tstr/bstr values
+                        to be processed without reassembly.
   --output-c, --oc OUTPUT_C
                         Path to output C file. If both --decode and --encode
                         are specified, _decode and _encode will be appended to

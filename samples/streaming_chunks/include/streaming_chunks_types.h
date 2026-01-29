@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022 Nordic Semiconductor ASA
+ * Copyright (c) 2026
  *
  * SPDX-License-Identifier: Apache-2.0
  *
@@ -8,8 +8,8 @@
  * Generated with a --default-max-qty of 3
  */
 
-#ifndef PET_TYPES_H__
-#define PET_TYPES_H__
+#ifndef STREAMING_CHUNKS_TYPES_H__
+#define STREAMING_CHUNKS_TYPES_H__
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -39,19 +39,13 @@ extern "C" {
 #define ZCBOR_STREAM_STATE_ARRAY_SIZE 8
 #endif
 
-struct Pet {
-	struct zcbor_string names[3];
-	size_t names_count;
-	struct zcbor_string birthday;
-	enum {
-		Pet_species_cat_c = 1,
-		Pet_species_dog_c = 2,
-		Pet_species_other_c = 3,
-	} species_choice;
+struct StreamItem {
+	struct zcbor_string StreamItem_name;
+	struct zcbor_string StreamItem_payload;
 };
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* PET_TYPES_H__ */
+#endif /* STREAMING_CHUNKS_TYPES_H__ */

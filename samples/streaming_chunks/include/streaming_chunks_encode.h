@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022 Nordic Semiconductor ASA
+ * Copyright (c) 2026
  *
  * SPDX-License-Identifier: Apache-2.0
  *
@@ -8,8 +8,8 @@
  * Generated with a --default-max-qty of 3
  */
 
-#ifndef PET_ENCODE_H__
-#define PET_ENCODE_H__
+#ifndef STREAMING_CHUNKS_ENCODE_H__
+#define STREAMING_CHUNKS_ENCODE_H__
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -17,7 +17,7 @@
 #include <string.h>
 #include "zcbor_encode.h"
 #include "zcbor_decode.h"
-#include "pet_types.h"
+#include "streaming_chunks_types.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,9 +27,9 @@ extern "C" {
 #error "The type file was generated with a different default_max_qty than this file"
 #endif
 
-int cbor_encode_Pet(
+int cbor_encode_StreamItem(
 		uint8_t *payload, size_t payload_len,
-		const struct Pet *input,
+		const struct StreamItem *input,
 		size_t *payload_len_out);
 
 /* Streaming encode helpers */
@@ -52,31 +52,31 @@ struct zcbor_chunk_in {
 };
 #endif
 
-#ifndef CBOR_STREAM_IO_PET_DEFINED
-#define CBOR_STREAM_IO_PET_DEFINED
-struct cbor_stream_io_Pet {
+#ifndef CBOR_STREAM_IO_STREAMITEM_DEFINED
+#define CBOR_STREAM_IO_STREAMITEM_DEFINED
+struct cbor_stream_io_StreamItem {
 	/* Repeated fields (iterator) */
-	struct zcbor_stream_iter_io Pet_name_names;
+	/* no repeated iters */
 
 	/* Text string fields (chunk_out) */
-	/* no tstr chunk_out io */
+	struct zcbor_chunk_out chunks_out_StreamItem_name;
 
 	/* Byte string fields (chunk_out) */
-	struct zcbor_chunk_out chunks_out_Timestamp;
+	struct zcbor_chunk_out chunks_out_StreamItem_payload;
 
 	/* Text string fields (chunk_in) */
-	/* no tstr chunk_in io */
+	struct zcbor_chunk_in chunks_in_StreamItem_name;
 
 	/* Byte string fields (chunk_in) */
-	struct zcbor_chunk_in chunks_in_Timestamp;
+	struct zcbor_chunk_in chunks_in_StreamItem_payload;
 };
 #endif
-typedef struct cbor_stream_io_Pet cbor_stream_io_Pet;
+typedef struct cbor_stream_io_StreamItem cbor_stream_io_StreamItem;
 
-int cbor_stream_encode_Pet(
+int cbor_stream_encode_StreamItem(
 		zcbor_stream_write_fn stream_write, void *stream_user_data,
-		const struct Pet *input,
-		const cbor_stream_io_Pet *io,
+		const struct StreamItem *input,
+		const cbor_stream_io_StreamItem *io,
 		size_t *bytes_written_out);
 
 
@@ -88,4 +88,4 @@ int cbor_stream_encode_Pet(
 }
 #endif
 
-#endif /* PET_ENCODE_H__ */
+#endif /* STREAMING_CHUNKS_ENCODE_H__ */

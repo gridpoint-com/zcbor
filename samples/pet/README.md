@@ -7,6 +7,7 @@ structure. The 3 data structures are created in 3 different ways:
 1. Converted from YAML using the zcbor script (See [CMakeLists.txt](CMakeLists.txt), [pet1.yml](pet1.yml), and pet1.h).
 2. Encoded using the zcbor C API.
 3. Encoded using zcbor-generated C code.
+4. Encoded using zcbor-generated streaming entrypoints.
 
 The generated code is found in [src](src) and [include](include).
 To regenerate the files, invoke the [CMakeLists.txt](CMakeLists.txt) file with `-DREGENERATE_ZCBOR=Y`.
@@ -41,3 +42,7 @@ build/app
 > Name: Gary Giraffe
 > Birthday: 0x010203040a0b0c0d
 > Species: Other
+> 
+> Name: Sammy Streaming
+> Birthday: 0xaabbccddeeff1122
+> Species: Cat

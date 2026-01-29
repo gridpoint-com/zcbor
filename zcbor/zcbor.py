@@ -215,7 +215,7 @@ class CddlParser:
     - For "GROUP" and "UNION" types, there is no separate data item for the instance.
     """
     def __init__(self, default_max_qty, my_types, my_control_groups, base_name=None,
-                 short_names=False, base_stem=''):
+                 short_names=False, base_stem='', in_map=False):
         self.id_prefix = "temp_" + str(counter())
         self.id_num = None  # Unique ID number. Only populated if needed.
         # The value of the data item. Has different meaning for different
@@ -263,6 +263,7 @@ class CddlParser:
         # Stem which can be used when generating an id.
         self.base_stem = base_stem.replace("-", "_")
         self.short_names = short_names
+        self.in_map = in_map
 
         if type(self) not in type(self).cddl_regexes:
             self.cddl_regexes_init()
@@ -438,7 +439,7 @@ class CddlParser:
         """Return the kwargs that should be used to initialize a new instance of this class."""
         return {
             "my_types": self.my_types, "my_control_groups": self.my_control_groups,
-            "short_names": self.short_names}
+            "short_names": self.short_names, "in_map": self.in_map}
 
     def set_id_prefix(self, id_prefix=''):
         self.id_prefix = id_prefix
@@ -699,6 +700,7 @@ class CddlParser:
         if key.type == "GROUP":
             raise TypeError("A key cannot be a group because it might represent more than 1 type.")
         self.key = key
+        key.is_key = True
 
     def set_key_or_label(self, key_or_label):
         """Set the self.label OR self.key of this element.
@@ -707,7 +709,7 @@ class CddlParser:
         map. This code uses a slightly different method for choosing between label and key.
         If the string is recognized as a type, it is treated as a key. For use during CDDL parsing.
         """
-        if key_or_label in self.my_types:
+        if self.in_map and key_or_label in self.my_types:
             self.set_key(self.parse(key_or_label)[0])
             assert self.key.type == "OTHER", "This should only be able to produce an OTHER key."
             if self.label is None:
@@ -784,13 +786,13 @@ class CddlParser:
         range_types = [
             (r'(?P<bracket>\[(?P<item>(?>[^[\]]+|(?&bracket))*)\])',
              lambda m_self, list_str: m_self.type_and_value(
-                 "LIST", lambda: m_self.parse(list_str))),
+                 "LIST", lambda: m_self.parse(list_str, in_map=False))),
             (r'(?P<paren>\((?P<item>(?>[^\(\)]+|(?&paren))*)\))',
              lambda m_self, group_str: m_self.type_and_value(
-                 "GROUP", lambda: m_self.parse(group_str))),
+                 "GROUP", lambda: m_self.parse(group_str, in_map=m_self.in_map))),
             (r'(?P<curly>{(?P<item>(?>[^{}]+|(?&curly))*)})',
              lambda m_self, map_str: m_self.type_and_value(
-                 "MAP", lambda: m_self.parse(map_str))),
+                 "MAP", lambda: m_self.parse(map_str, in_map=True))),
             (r'\'(?P<item>.*?)(?<!\\)\'',
              lambda m_self, string: m_self.type_and_value("BSTR", lambda: string)),
             (r'\"(?P<item>.*?)(?<!\\)\"',
@@ -1004,12 +1006,16 @@ class CddlParser:
             if c.type != "UINT" or c.value is None or c.value < 0:
                 raise TypeError("control group members must be literal positive integers.")
 
-    def parse(self, instr):
+    def parse(self, instr, in_map=None):
         """Parses entire instr and returns a list of instances."""
+        if in_map is None:
+            in_map = self.in_map
         instr = instr.strip()
         values = []
         while instr != '':
-            value = type(self)(*self.init_args(), **self.init_kwargs(), base_stem=self.base_stem)
+            kwargs = self.init_kwargs()
+            kwargs["in_map"] = in_map
+            value = type(self)(*self.init_args(), **kwargs, base_stem=self.base_stem)
             instr = value.get_value(instr)
             values.append(value)
         return values
@@ -1057,6 +1063,21 @@ class CddlXcoder(CddlParser):
         elif name in c_keywords_underscore:
             name = "_" + name
         return name
+
+    def stream_chunk_field_name(self, direction=None):
+        """Field name for streaming chunk io, derived from map key path."""
+        base_name = self.var_name(with_prefix=True, observe_skipped=False)
+        key_nums = getrp(r"(?:^|_)(?:u?int|nint)(\d+)").findall(base_name)
+
+        if key_nums:
+            suffix = f"{'_'.join(key_nums)}"
+        else:
+            suffix = base_name
+
+        if direction:
+            return f"chunks_{direction}_{suffix}"
+
+        return f"chunks_{suffix}"
 
     def skip_condition(self):
         """Whether this element should have its result variable omitted."""
@@ -1864,11 +1885,15 @@ class CddlTypes(NamedTuple):
 class CodeGenerator(CddlXcoder):
     """Class for generating C code that encode/decodes CBOR and validates it according to the CDDL.
     """
-    def __init__(self, mode, entry_type_names, default_bit_size, *args, **kwargs):
+    def __init__(self, mode, entry_type_names, default_bit_size, repeated_as_pointers,
+                 stream_encode_functions, stream_decode_functions, *args, **kwargs):
         super(CodeGenerator, self).__init__(*args, **kwargs)
         self.mode = mode
         self.entry_type_names = entry_type_names
         self.default_bit_size = default_bit_size
+        self.repeated_as_pointers = repeated_as_pointers
+        self.stream_encode_functions = stream_encode_functions
+        self.stream_decode_functions = stream_decode_functions
 
     @classmethod
     def from_cddl(cddl_class, mode, *args, **kwargs):
@@ -1891,7 +1916,15 @@ class CodeGenerator(CddlXcoder):
         return res
 
     def init_args(self):
-        return (self.mode, self.entry_type_names, self.default_bit_size, self.default_max_qty)
+        return (
+            self.mode,
+            self.entry_type_names,
+            self.default_bit_size,
+            self.repeated_as_pointers,
+            self.stream_encode_functions,
+            self.stream_decode_functions,
+            self.default_max_qty,
+        )
 
     def delegate_type_condition(self):
         """Whether to use the C type of the first child as this type's C type"""
@@ -2047,8 +2080,12 @@ class CodeGenerator(CddlXcoder):
                 f"Expected single var: {var_type!r}"
             if not anonymous or var_type[-1][-1] != "}":
                 var_name = self.var_name()
-                array_part = f"[{self.max_qty}]" if full and self.max_qty != 1 else ""
-                var_type[-1] += f" {var_name}{array_part}"
+                if full and self.max_qty != 1 and self.repeated_as_pointers:
+                    # Repeated fields become pointer + *_count (caller-owned storage).
+                    var_type[-1] += f" *{var_name}"
+                else:
+                    array_part = f"[{self.max_qty}]" if full and self.max_qty != 1 else ""
+                    var_type[-1] += f" {var_name}{array_part}"
             var_type = add_semicolon(var_type)
         return var_type
 
@@ -2227,7 +2264,23 @@ class CodeGenerator(CddlXcoder):
 
     def repeated_xcode_func_name(self):
         """Name of the encoder/decoder function for the repeated part of this element."""
-        return f"{self.mode}_repeated_{self.var_name(with_prefix=True, observe_skipped=False)}"
+        base_name = self.var_name(with_prefix=True, observe_skipped=False)
+        access_prefix = self.accessPrefix
+        key_suffix = ""
+
+        if self.key and self.key.value is not None:
+            key_value = getrp(r'[^a-zA-Z0-9_]').sub("_", str(self.key.value)).strip("_")
+            if key_value:
+                key_suffix = f"_key{key_value}"
+
+        if access_prefix:
+            access_name = access_prefix.replace("(*", "").replace(")", "")
+            access_name = access_name.replace("->", "_").replace(".", "_")
+            access_name = getrp(r'[^a-zA-Z0-9_]').sub("_", access_name).strip("_")
+            if access_name and access_name not in base_name:
+                return f"{self.mode}_repeated_{access_name}_{base_name}{key_suffix}"
+
+        return f"{self.mode}_repeated_{base_name}{key_suffix}"
 
     def single_func_prim_name(self, union_int=None, ptr_result=False):
         """Function name for xcoding this type, when it is a primitive type"""
@@ -2347,6 +2400,60 @@ class CodeGenerator(CddlXcoder):
         """Make a string from the list returned by single_func_prim()"""
         return xcode_statement(*self.single_func_prim(self.val_access(), union_int))
 
+    def xcode_tstr_streaming(self):
+        if self.mode != "encode" or not self.stream_encode_functions:
+            return None
+        if self.value is not None or self.cbor:
+            return None
+        if getattr(self, "is_key", False):
+            return None
+        if self.count_var_condition():
+            return None
+
+        prov_access = "((const struct cbor_stream_io *)zcbor_get_stream_io(state))"
+        chunk_name = self.stream_chunk_field_name("out")
+        chunk_call = (
+            f"zcbor_tstr_chunk_out(state, "
+            f"{prov_access}->{chunk_name}.call, {prov_access}->{chunk_name}.ctx)"
+        )
+        chunk_check = f"({prov_access} && {prov_access}->{chunk_name}.call)"
+
+        fallback = self.xcode_single_func_prim()
+        return f"({chunk_check} ? ({chunk_call}) : ({fallback}))"
+
+    def xcode_tstr_streaming_decode(self):
+        if self.mode != "decode" or not self.stream_decode_functions:
+            return None
+        if self.value is not None or self.cbor:
+            return None
+        if getattr(self, "is_key", False):
+            return None
+        if self.count_var_condition():
+            return None
+
+        prov_access = (
+            "((const struct cbor_stream_io *)"
+            "zcbor_get_stream_io(state))"
+        )
+        chunk_name = self.stream_chunk_field_name("in")
+        chunk_call = (
+            f"zcbor_tstr_chunk_in(state, "
+            f"{prov_access}->{chunk_name}.call, {prov_access}->{chunk_name}.ctx)"
+        )
+        chunk_check = f"({prov_access} && {prov_access}->{chunk_name}.call)"
+
+        fallback = self.xcode_single_func_prim()
+        return f"({chunk_check} ? ({chunk_call}) : ({fallback}))"
+
+    def xcode_tstr(self):
+        """Encode TSTR, with optional streaming chunk io support."""
+        stream_xcode = self.xcode_tstr_streaming()
+        if stream_xcode is None:
+            stream_xcode = self.xcode_tstr_streaming_decode()
+        if stream_xcode is not None:
+            return stream_xcode
+        return self.xcode_single_func_prim()
+
     def list_counts(self):
         """Recursively sum the total minimum and maximum element count for this element."""
         retval = ({
@@ -2386,9 +2493,18 @@ class CodeGenerator(CddlXcoder):
             "zcbor_map_end_decode", "zcbor_map_end_encode"]
         assert self.type in ["LIST", "MAP"], \
             "Expected LIST or MAP type, was %s." % self.type
-        _, max_counts = zip(
-            *(child.list_counts() for child in self.value)) if self.value else ((0,), (0,))
-        count_arg = f', {str(sum(max_counts))}' if self.mode == 'encode' else ''
+
+        # Default: definite-length. When generating streaming encode entrypoints, use
+        # indefinite-length containers.
+        if self.mode == 'encode' and self.stream_encode_functions:
+            count_arg = ', ZCBOR_VALUE_IS_INDEFINITE_LENGTH'
+        elif self.mode == 'encode':
+            _, max_counts = zip(
+                *(child.list_counts() for child in self.value)) if self.value else ((0,), (0,))
+            count_arg = f', {str(sum(max_counts))}'
+        else:
+            count_arg = ''
+
         with_children = "(%s && ((%s) || (%s, false)) && %s)" % (
             f"{start_func}(state{count_arg})",
             f"{newl_ind}&& ".join(child.full_xcode() for child in self.value),
@@ -2448,7 +2564,57 @@ class CodeGenerator(CddlXcoder):
                 [child.enum_var_name() for child in self.value],
                 [child.full_xcode() for child in self.value])
 
+    def xcode_bstr_streaming(self):
+        if self.mode != "encode" or not self.stream_encode_functions:
+            return None
+        if self.value is not None or self.cbor:
+            return None
+        if getattr(self, "is_key", False):
+            return None
+        if self.count_var_condition():
+            return None
+
+        prov_access = "((const struct cbor_stream_io *)zcbor_get_stream_io(state))"
+        chunk_name = self.stream_chunk_field_name("out")
+        chunk_call = (
+            f"zcbor_bstr_chunk_out(state, "
+            f"{prov_access}->{chunk_name}.call, {prov_access}->{chunk_name}.ctx)"
+        )
+        chunk_check = f"({prov_access} && {prov_access}->{chunk_name}.call)"
+
+        fallback = self.xcode_single_func_prim()
+        return f"({chunk_check} ? ({chunk_call}) : ({fallback}))"
+
+    def xcode_bstr_streaming_decode(self):
+        if self.mode != "decode" or not self.stream_decode_functions:
+            return None
+        if self.value is not None or self.cbor:
+            return None
+        if getattr(self, "is_key", False):
+            return None
+        if self.count_var_condition():
+            return None
+
+        prov_access = (
+            "((const struct cbor_stream_io *)"
+            "zcbor_get_stream_io(state))"
+        )
+        chunk_name = self.stream_chunk_field_name("in")
+        chunk_call = (
+            f"zcbor_bstr_chunk_in(state, "
+            f"{prov_access}->{chunk_name}.call, {prov_access}->{chunk_name}.ctx)"
+        )
+        chunk_check = f"({prov_access} && {prov_access}->{chunk_name}.call)"
+
+        fallback = self.xcode_single_func_prim()
+        return f"({chunk_check} ? ({chunk_call}) : ({fallback}))"
+
     def xcode_bstr(self):
+        stream_xcode = self.xcode_bstr_streaming()
+        if stream_xcode is None:
+            stream_xcode = self.xcode_bstr_streaming_decode()
+        if stream_xcode is not None:
+            return stream_xcode
         if self.cbor and not self.cbor.is_entry_type():
             access_arg = f', {deref_if_not_null(self.val_access())}' if self.mode == 'decode' \
                 else ''
@@ -2545,7 +2711,7 @@ class CodeGenerator(CddlXcoder):
             "NINT": lambda: self.xcode_single_func_prim(val_union_int),
             "FLOAT": self.xcode_single_func_prim,
             "BSTR": self.xcode_bstr,
-            "TSTR": self.xcode_single_func_prim,
+            "TSTR": self.xcode_tstr,
             "BOOL": self.xcode_single_func_prim,
             "NIL": self.xcode_single_func_prim,
             "UNDEF": self.xcode_single_func_prim,
@@ -2604,10 +2770,47 @@ class CodeGenerator(CddlXcoder):
 
             minmax = "_minmax" if self.mode == "encode" else ""
             mode = self.mode
+
+            # Keep encode max_qty overrideable (streaming write entrypoints only) when the CDDL
+            # omitted a max and we fell back to --default-max-qty.
+            if (self.mode == "encode"
+                    and self.stream_encode_functions
+                    and self.max_qty == self.default_max_qty):
+                max_qty = "DEFAULT_MAX_QTY"
+            else:
+                max_qty = self.max_qty
+
+            # Optional streaming encode: stream io iterator overrides pointer+count.
+            if self.mode == "encode" and self.stream_encode_functions:
+                prov_name = self.var_name(with_prefix=True, observe_skipped=False)
+                prov_access = (
+                    "((const struct cbor_stream_io *)"
+                    "zcbor_get_stream_io(state))"
+                )
+                has_prov = f"({prov_access} && {prov_access}->{prov_name}.next)"
+                iter_call = (
+                    f"zcbor_multi_encode_iter_minmax({self.min_qty}, {max_qty}, "
+                    f"(zcbor_encoder_t *){func}, state, {prov_access}->{prov_name}.next, "
+                    f"{prov_access}->{prov_name}.ctx)"
+                )
+                ptr_arg = (
+                    "*" + arg
+                    if arg != "NULL" and self.result_len() != "0"
+                    else arg
+                )
+                ptr_call = (
+                    f"zcbor_multi_{mode}{minmax}("
+                    f"{self.min_qty}, {max_qty}, &{self.count_var_access()}, "
+                    f"(zcbor_{mode}r_t *){func}, "
+                    f"{xcode_args(ptr_arg)}, "
+                    f"{self.result_len()})"
+                )
+                return f"({has_prov} ? ({iter_call}) : ({ptr_call}))"
+
             return (
                 f"zcbor_multi_{mode}{minmax}(%s, %s, &%s, (zcbor_{mode}r_t *)%s, %s, %s)" %
                 (self.min_qty,
-                 self.max_qty,
+                 max_qty,
                  self.count_var_access(),
                  func,
                  xcode_args("*" + arg if arg != "NULL" and self.result_len() != "0" else arg),
@@ -2645,19 +2848,29 @@ class CodeGenerator(CddlXcoder):
 
     def public_xcode_func_sig(self):
         type_name = self.type_name() if struct_ptr_name(self.mode) in self.full_xcode() else "void"
-        return f"""
-int cbor_{self.xcode_func_name()}(
+        return f"""int cbor_{self.xcode_func_name()}(
 		{"const " if self.mode == "decode" else ""}uint8_t *payload, size_t payload_len,
 		{"" if self.mode == "decode" else "const "}{type_name} *{struct_ptr_name(self.mode)},
 		{"size_t *payload_len_out"})"""
 
+    def public_stream_decode_func_sig(self):
+        type_name = self.type_name() if struct_ptr_name("decode") in self.full_xcode() else "void"
+        io_name = f"cbor_stream_io_{self.var_name(with_prefix=True, observe_skipped=False)}"
+        return f"""int cbor_stream_decode_{self.var_name(with_prefix=True, observe_skipped=False)}(
+		const uint8_t *payload, size_t payload_len,
+		{type_name} *{struct_ptr_name("decode")},
+		const struct {io_name} *io,
+		size_t *payload_len_out)"""
+
 
 class CodeRenderer():
-    def __init__(self, entry_types, modes, print_time, default_max_qty, git_sha='', file_header=''):
+    def __init__(self, entry_types, modes, print_time, default_max_qty, git_sha='', file_header='',
+                 stream_encode_functions=False, stream_decode_functions=False):
         self.entry_types = entry_types
         self.print_time = print_time
         self.default_max_qty = default_max_qty
-
+        self.stream_encode_functions = stream_encode_functions
+        self.stream_decode_functions = stream_decode_functions
         self.sorted_types = dict()
         self.functions = dict()
         self.type_defs = dict()
@@ -2682,6 +2895,82 @@ class CodeRenderer():
 https://github.com/NordicSemiconductor/zcbor{'''
 at: ''' + datetime.now().strftime('%Y-%m-%d %H:%M:%S') if self.print_time else ''}
 Generated with a --default-max-qty of {self.default_max_qty}"""
+
+    def stream_io_type_name(self, xcoder):
+        entry_name = xcoder.var_name(with_prefix=True, observe_skipped=False)
+        return f"cbor_stream_io_{entry_name}"
+
+    def collect_stream_iter_names_for_entry(self, entry):
+        if not self.stream_encode_functions:
+            return []
+
+        repeats = set()
+        visited = set()
+
+        def walk(elem):
+            if id(elem) in visited:
+                return
+            visited.add(id(elem))
+
+            if elem.count_var_condition():
+                repeats.add(elem.var_name(with_prefix=True, observe_skipped=False))
+
+            if elem.type in ["LIST", "MAP", "GROUP", "UNION"]:
+                for child in elem.value:
+                    walk(child)
+
+            if elem.cbor:
+                walk(elem.cbor)
+
+            if elem.key:
+                walk(elem.key)
+
+            if elem.type == "OTHER" and elem.value in elem.my_types:
+                walk(elem.my_types[elem.value])
+
+        walk(entry)
+        return sorted(repeats)
+
+    def collect_stream_chunk_names_for_entry(self, entry, direction):
+        if not (self.stream_encode_functions or self.stream_decode_functions):
+            return ([], [])
+
+        tstrs = set()
+        bstrs = set()
+        visited = set()
+
+        def walk(elem):
+            if id(elem) in visited:
+                return
+            visited.add(id(elem))
+
+            if (not elem.count_var_condition()
+                    and elem.type == "TSTR"
+                    and elem.value is None
+                    and not elem.cbor):
+                tstrs.add(elem.stream_chunk_field_name(direction))
+
+            if (not elem.count_var_condition()
+                    and elem.type == "BSTR"
+                    and elem.value is None
+                    and not elem.cbor):
+                bstrs.add(elem.stream_chunk_field_name(direction))
+
+            if elem.type in ["LIST", "MAP", "GROUP", "UNION"]:
+                for child in elem.value:
+                    walk(child)
+
+            if elem.cbor:
+                walk(elem.cbor)
+
+            if elem.key:
+                walk(elem.key)
+
+            if elem.type == "OTHER" and elem.value in elem.my_types:
+                walk(elem.my_types[elem.value])
+
+        walk(entry)
+        return (sorted(tstrs), sorted(bstrs))
 
     def header_guard(self, file_name):
         return path.basename(file_name).replace(".", "_").replace("-", "_").upper() + "__"
@@ -2803,10 +3092,9 @@ static bool {xcoder.func_name}(
     def render_entry_function(self, xcoder, mode):
         """Render a single entry function (API function) with signature and body."""
         func_name, func_arg = (xcoder.xcode_func_name(), struct_ptr_name(mode))
-        return f"""
-{xcoder.public_xcode_func_sig()}
+        return f"""{xcoder.public_xcode_func_sig()}
 {{
-	zcbor_state_t states[{xcoder.num_backups() + 2}];
+	zcbor_state_t states[{xcoder.num_backups() + 1} + ZCBOR_CONST_STATE_SLOTS];
 
 	return zcbor_entry_function(payload, payload_len, (void *){func_arg}, payload_len_out, states,
 		(zcbor_decoder_t *){func_name}, sizeof(states) / sizeof(zcbor_state_t), {
@@ -2828,7 +3116,19 @@ do { \\
 		zcbor_log("%s success\\r\\n", func); \\
 	} \\
 } while(0)"""
-        return f"""/*{self.render_file_header(" *")}
+        stream_io_internal = ""
+        if mode == "encode" and self.stream_encode_functions:
+            stream_io_internal = self.render_internal_stream_io_type()
+        if mode == "decode" and self.stream_decode_functions:
+            stream_io_internal = self.render_internal_stream_io_decode_type()
+
+        default_max_qty_macro = (
+            "ZCBOR_GENERATED_DEFAULT_MAX_QTY"
+            if (self.stream_encode_functions or self.stream_decode_functions)
+            else "DEFAULT_MAX_QTY"
+        )
+
+        return (f"""/*{self.render_file_header(" *")}
  */
 
 #include <stdint.h>
@@ -2839,22 +3139,100 @@ do { \\
 #include "{header_file_name}"
 #include "zcbor_print.h"
 
-#if DEFAULT_MAX_QTY != {self.default_max_qty}
+#if {default_max_qty_macro} \
+!= {self.default_max_qty}
 #error "The type file was generated with a different default_max_qty than this file"
 #endif
 
 {log_result_define}
+
+{stream_io_internal}
 
 {linesep.join([self.render_forward_declaration(xcoder, mode) for xcoder in self.functions[mode]])}
 
 {linesep.join([self.render_function(xcoder, mode) for xcoder in self.functions[mode]])}
 
 {linesep.join([self.render_entry_function(xcoder, mode) for xcoder in self.entry_types[mode]])}
-"""
+
+{self.render_write_impls(mode) if self.stream_encode_functions and mode == "encode" else ""}
+
+{self.render_stream_decode_impls(mode) if self.stream_decode_functions and mode == "decode" else ""}
+""").rstrip() + "\n"
+
+    def render_write_impls(self, mode):
+        if mode != "encode":
+            return ""
+        return (linesep * 2).join([
+            f"""int cbor_stream_encode_{xcoder.var_name(with_prefix=True, observe_skipped=False)}(
+\t\tzcbor_stream_write_fn stream_write, void *stream_user_data,
+\t\tconst {xcoder.type_name() if struct_ptr_name(mode) in xcoder.full_xcode() else "void"} *input,
+\t\tconst {self.stream_io_type_name(xcoder)} *io,
+\t\tsize_t *bytes_written_out)
+{{
+\tzcbor_state_t states[ZCBOR_STREAM_STATE_ARRAY_SIZE];
+\tzcbor_new_encode_state_streaming(states, sizeof(states) / sizeof(states[0]),
+\t\tstream_write, stream_user_data, 1);
+\tstruct cbor_stream_io io_local = {{0}};
+\tif (io) {{
+\t\t{self.render_stream_io_copy(xcoder)}
+\t\tzcbor_set_stream_io(&states[0], &io_local);
+\t}} else {{
+\t\tzcbor_set_stream_io(&states[0], NULL);
+\t}}
+\tbool ok = {xcoder.xcode_func_name()}(&states[0], input);
+\tif (!ok) {{
+\t\tint err = zcbor_pop_error(&states[0]);
+\t\treturn (err == ZCBOR_SUCCESS) ? ZCBOR_ERR_UNKNOWN : err;
+\t}}
+\tif (bytes_written_out) {{
+\t\t*bytes_written_out = zcbor_stream_bytes_written(&states[0]);
+\t}}
+\treturn ZCBOR_SUCCESS;
+}}"""
+            for xcoder in self.entry_types[mode]
+        ])
+
+    def render_stream_decode_impls(self, mode):
+        if mode != "decode":
+            return ""
+        return (linesep * 2).join([
+            f"""int cbor_stream_decode_{xcoder.var_name(with_prefix=True, observe_skipped=False)}(
+\t\tconst uint8_t *payload, size_t payload_len,
+\t\t{xcoder.type_name() if struct_ptr_name(mode) in xcoder.full_xcode() else "void"} *result,
+\t\tconst {self.stream_io_type_name(xcoder)} *io,
+\t\tsize_t *payload_len_out)
+{{
+\tzcbor_state_t states[{xcoder.num_backups() + 1} + ZCBOR_CONST_STATE_SLOTS];
+\tzcbor_new_state(states, sizeof(states) / sizeof(states[0]), payload, payload_len,
+\t\t{xcoder.list_counts()[1]}, NULL, 0);
+\tstruct cbor_stream_io io_local = {{0}};
+\tif (io) {{
+\t\t{self.render_stream_io_decode_copy(xcoder)}
+\t\tzcbor_set_stream_io(&states[0], &io_local);
+\t}} else {{
+\t\tzcbor_set_stream_io(&states[0], NULL);
+\t}}
+\tbool ok = {xcoder.xcode_func_name()}(&states[0], result);
+\tif (!ok) {{
+\t\tint err = zcbor_pop_error(&states[0]);
+\t\treturn (err == ZCBOR_SUCCESS) ? ZCBOR_ERR_UNKNOWN : err;
+\t}}
+\tif (payload_len_out != NULL) {{
+\t\t*payload_len_out = MIN(payload_len,
+\t\t\t(size_t)states[0].payload - (size_t)payload);
+\t}}
+\treturn ZCBOR_SUCCESS;
+}}"""
+            for xcoder in self.entry_types[mode]
+        ])
 
     def render_h_file(self, type_def_file, header_guard, mode):
         """Render the entire generated header file contents."""
-        return \
+        if self.stream_encode_functions or self.stream_decode_functions:
+            write_includes = '#include "zcbor_encode.h"\n#include "zcbor_decode.h"'
+        else:
+            write_includes = ""
+        return (
             f"""/*{self.render_file_header(" *")}
  */
 
@@ -2865,17 +3243,26 @@ do { \\
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
+{write_includes}
 #include "{type_def_file}"
 
 #ifdef __cplusplus
 extern "C" {{
 #endif
 
-#if DEFAULT_MAX_QTY != {self.default_max_qty}
+#if {"ZCBOR_GENERATED_DEFAULT_MAX_QTY" if (self.stream_encode_functions or self.stream_decode_functions) else "DEFAULT_MAX_QTY"} != {self.default_max_qty}
 #error "The type file was generated with a different default_max_qty than this file"
 #endif
 
 {(linesep * 2).join([f"{xcoder.public_xcode_func_sig()};" for xcoder in self.entry_types[mode]])}
+
+{self.render_write_types(mode) if self.stream_encode_functions and mode == "encode" else ""}
+
+{self.render_write_decls(mode) if self.stream_encode_functions and mode == "encode" else ""}
+
+{self.render_decode_types(mode) if self.stream_decode_functions and mode == "decode" else ""}
+
+{self.render_stream_decode_decls(mode) if self.stream_decode_functions and mode == "decode" else ""}
 
 
 #ifdef __cplusplus
@@ -2883,14 +3270,431 @@ extern "C" {{
 #endif
 
 #endif /* {header_guard} */
+""").rstrip() + "\n"
+
+    def render_write_types(self, mode):
+        if mode != "encode":
+            return ""
+
+        if not self.stream_encode_functions:
+            return ""
+
+        iter_provider = """struct zcbor_stream_iter_io {
+	void *ctx;
+	zcbor_stream_iter next;
+};
 """
+        chunk_out_provider = """#ifndef ZCBOR_CHUNK_OUT_DEFINED
+#define ZCBOR_CHUNK_OUT_DEFINED
+struct zcbor_chunk_out {
+	void *ctx;
+	zcbor_stream_chunk_out call;
+};
+#endif
+"""
+        chunk_in_provider = """#ifndef ZCBOR_CHUNK_IN_DEFINED
+#define ZCBOR_CHUNK_IN_DEFINED
+struct zcbor_chunk_in {
+	void *ctx;
+	zcbor_stream_chunk_in call;
+};
+#endif
+"""
+        bstr_push_provider = ""
+
+        def render_entry_struct(entry):
+            repeats = self.collect_stream_iter_names_for_entry(entry)
+            tstr_out, bstr_out = self.collect_stream_chunk_names_for_entry(entry, "out")
+            tstr_in, bstr_in = self.collect_stream_chunk_names_for_entry(entry, "in")
+
+            repeat_fields = linesep.join(
+                [f"\tstruct zcbor_stream_iter_io {name};" for name in repeats]
+            )
+            tstr_out_fields = linesep.join(
+                [f"\tstruct zcbor_chunk_out {name};" for name in tstr_out]
+            )
+            bstr_out_fields = linesep.join(
+                [f"\tstruct zcbor_chunk_out {name};" for name in bstr_out]
+            )
+            tstr_in_fields = linesep.join(
+                [f"\tstruct zcbor_chunk_in {name};" for name in tstr_in]
+            )
+            bstr_in_fields = linesep.join(
+                [f"\tstruct zcbor_chunk_in {name};" for name in bstr_in]
+            )
+
+            if not repeat_fields:
+                repeat_fields = "\t/* no repeated iters */"
+            if not tstr_out_fields:
+                tstr_out_fields = "\t/* no tstr chunk_out io */"
+            if not bstr_out_fields:
+                bstr_out_fields = "\t/* no bstr chunk_out io */"
+            if not tstr_in_fields:
+                tstr_in_fields = "\t/* no tstr chunk_in io */"
+            if not bstr_in_fields:
+                bstr_in_fields = "\t/* no bstr chunk_in io */"
+
+            struct_name = self.stream_io_type_name(entry)
+            entry_name = entry.var_name(with_prefix=True, observe_skipped=False)
+            guard = f"CBOR_STREAM_IO_{entry_name.upper()}_DEFINED"
+            return f"""#ifndef {guard}
+#define {guard}
+struct {struct_name} {{
+	/* Repeated fields (iterator) */
+{repeat_fields}
+
+	/* Text string fields (chunk_out) */
+{tstr_out_fields}
+
+	/* Byte string fields (chunk_out) */
+{bstr_out_fields}
+
+	/* Text string fields (chunk_in) */
+{tstr_in_fields}
+
+	/* Byte string fields (chunk_in) */
+{bstr_in_fields}
+}};
+#endif
+typedef struct {struct_name} {struct_name};"""
+
+        stream_comment = "/* Streaming encode helpers */"
+        entry_structs = (linesep * 2).join(
+            [render_entry_struct(entry) for entry in self.entry_types["encode"]]
+        )
+
+        return f"""{stream_comment}
+{iter_provider}{chunk_out_provider}{chunk_in_provider}{bstr_push_provider}
+{entry_structs}"""
+
+    def render_decode_types(self, mode):
+        if mode != "decode":
+            return ""
+
+        if not self.stream_decode_functions:
+            return ""
+
+        chunk_out_provider = """#ifndef ZCBOR_CHUNK_OUT_DEFINED
+#define ZCBOR_CHUNK_OUT_DEFINED
+struct zcbor_chunk_out {
+	void *ctx;
+	zcbor_stream_chunk_out call;
+};
+#endif
+"""
+        chunk_in_provider = """#ifndef ZCBOR_CHUNK_IN_DEFINED
+#define ZCBOR_CHUNK_IN_DEFINED
+struct zcbor_chunk_in {
+	void *ctx;
+	zcbor_stream_chunk_in call;
+};
+#endif
+"""
+
+        def render_entry_struct(entry):
+            tstr_out, bstr_out = self.collect_stream_chunk_names_for_entry(entry, "out")
+            tstr_in, bstr_in = self.collect_stream_chunk_names_for_entry(entry, "in")
+
+            tstr_out_fields = linesep.join(
+                [f"\tstruct zcbor_chunk_out {name};" for name in tstr_out]
+            )
+            bstr_out_fields = linesep.join(
+                [f"\tstruct zcbor_chunk_out {name};" for name in bstr_out]
+            )
+            tstr_in_fields = linesep.join(
+                [f"\tstruct zcbor_chunk_in {name};" for name in tstr_in]
+            )
+            bstr_in_fields = linesep.join(
+                [f"\tstruct zcbor_chunk_in {name};" for name in bstr_in]
+            )
+
+            if not tstr_out_fields:
+                tstr_out_fields = "\t/* no tstr chunk_out io */"
+            if not bstr_out_fields:
+                bstr_out_fields = "\t/* no bstr chunk_out io */"
+            if not tstr_in_fields:
+                tstr_in_fields = "\t/* no tstr chunk_in io */"
+            if not bstr_in_fields:
+                bstr_in_fields = "\t/* no bstr chunk_in io */"
+
+            struct_name = self.stream_io_type_name(entry)
+            entry_name = entry.var_name(with_prefix=True, observe_skipped=False)
+            guard = f"CBOR_STREAM_IO_{entry_name.upper()}_DEFINED"
+            return f"""#ifndef {guard}
+#define {guard}
+struct {struct_name} {{
+	/* Text string fields (chunk_out) */
+{tstr_out_fields}
+
+	/* Byte string fields (chunk_out) */
+{bstr_out_fields}
+
+	/* Text string fields (chunk_in) */
+{tstr_in_fields}
+
+	/* Byte string fields (chunk_in) */
+{bstr_in_fields}
+}};
+#endif
+typedef struct {struct_name} {struct_name};"""
+
+        stream_comment = "/* Streaming decode helpers */"
+        entry_structs = (linesep * 2).join(
+            [render_entry_struct(entry) for entry in self.entry_types["decode"]]
+        )
+
+        return f"""{stream_comment}
+{chunk_out_provider}{chunk_in_provider}
+{entry_structs}"""
+
+    def collect_stream_iter_names(self):
+        """Collect iterator field names for the whole schema (encode side only).
+
+        These names are stable, unique (with_prefix=True), and map directly to the
+        var_name() used in generated encode code.
+        """
+        if not self.stream_encode_functions:
+            return []
+
+        repeats = set()
+
+        visited = set()
+
+        def walk(elem):
+            # Avoid infinite recursion on self-referential types.
+            if id(elem) in visited:
+                return
+            visited.add(id(elem))
+
+            if elem.count_var_condition():
+                repeats.add(elem.var_name(with_prefix=True, observe_skipped=False))
+
+            if elem.type in ["LIST", "MAP", "GROUP", "UNION"]:
+                for child in elem.value:
+                    walk(child)
+
+            if elem.cbor:
+                walk(elem.cbor)
+
+            if elem.key:
+                walk(elem.key)
+
+            # Follow named types.
+            if elem.type == "OTHER" and elem.value in elem.my_types:
+                walk(elem.my_types[elem.value])
+
+        # Walk from all top-level types; this makes the io struct schema-wide.
+        for root in self.sorted_types["encode"]:
+            walk(root)
+
+        return sorted(repeats)
+
+    def collect_stream_chunk_names(self, direction):
+        """Collect chunk io field names for tstr/bstr (streaming)."""
+        if not (self.stream_encode_functions or self.stream_decode_functions):
+            return ([], [])
+
+        tstrs = set()
+        bstrs = set()
+        visited = set()
+
+        def walk(elem):
+            if id(elem) in visited:
+                return
+            visited.add(id(elem))
+
+            if (not elem.count_var_condition()
+                    and elem.type == "TSTR"
+                    and elem.value is None
+                    and not elem.cbor):
+                tstrs.add(elem.stream_chunk_field_name(direction))
+
+            if (not elem.count_var_condition()
+                    and elem.type == "BSTR"
+                    and elem.value is None
+                    and not elem.cbor):
+                bstrs.add(elem.stream_chunk_field_name(direction))
+
+            if elem.type in ["LIST", "MAP", "GROUP", "UNION"]:
+                for child in elem.value:
+                    walk(child)
+
+            if elem.cbor:
+                walk(elem.cbor)
+
+            if elem.key:
+                walk(elem.key)
+
+            if elem.type == "OTHER" and elem.value in elem.my_types:
+                walk(elem.my_types[elem.value])
+
+        for root in self.sorted_types["encode"]:
+            walk(root)
+
+        return (sorted(tstrs), sorted(bstrs))
+
+    def render_internal_stream_io_type(self):
+        repeats = self.collect_stream_iter_names()
+        tstr_out, bstr_out = self.collect_stream_chunk_names("out")
+        tstr_in, bstr_in = self.collect_stream_chunk_names("in")
+
+        repeat_fields = linesep.join(
+            [f"\tstruct zcbor_stream_iter_io {name};" for name in repeats]
+        )
+        tstr_out_fields = linesep.join(
+            [f"\tstruct zcbor_chunk_out {name};" for name in tstr_out]
+        )
+        bstr_out_fields = linesep.join(
+            [f"\tstruct zcbor_chunk_out {name};" for name in bstr_out]
+        )
+        tstr_in_fields = linesep.join(
+            [f"\tstruct zcbor_chunk_in {name};" for name in tstr_in]
+        )
+        bstr_in_fields = linesep.join(
+            [f"\tstruct zcbor_chunk_in {name};" for name in bstr_in]
+        )
+
+        if not repeat_fields:
+            repeat_fields = "\t/* no repeated iters */"
+        if not tstr_out_fields:
+            tstr_out_fields = "\t/* no tstr chunk_out io */"
+        if not bstr_out_fields:
+            bstr_out_fields = "\t/* no bstr chunk_out io */"
+        if not tstr_in_fields:
+            tstr_in_fields = "\t/* no tstr chunk_in io */"
+        if not bstr_in_fields:
+            bstr_in_fields = "\t/* no bstr chunk_in io */"
+
+        return f"""/* Streaming io struct (internal, schema-wide). */
+struct cbor_stream_io {{
+	/* Repeated fields (iterator) */
+{repeat_fields}
+
+	/* Text string fields (chunk_out) */
+{tstr_out_fields}
+
+	/* Byte string fields (chunk_out) */
+{bstr_out_fields}
+
+	/* Text string fields (chunk_in) */
+{tstr_in_fields}
+
+	/* Byte string fields (chunk_in) */
+{bstr_in_fields}
+}};"""
+
+    def render_internal_stream_io_decode_type(self):
+        tstr_out, bstr_out = self.collect_stream_chunk_names("out")
+        tstr_in, bstr_in = self.collect_stream_chunk_names("in")
+
+        tstr_out_fields = linesep.join(
+            [f"\tstruct zcbor_chunk_out {name};" for name in tstr_out]
+        )
+        bstr_out_fields = linesep.join(
+            [f"\tstruct zcbor_chunk_out {name};" for name in bstr_out]
+        )
+        tstr_in_fields = linesep.join(
+            [f"\tstruct zcbor_chunk_in {name};" for name in tstr_in]
+        )
+        bstr_in_fields = linesep.join(
+            [f"\tstruct zcbor_chunk_in {name};" for name in bstr_in]
+        )
+
+        if not tstr_out_fields:
+            tstr_out_fields = "\t/* no tstr chunk_out io */"
+        if not bstr_out_fields:
+            bstr_out_fields = "\t/* no bstr chunk_out io */"
+        if not tstr_in_fields:
+            tstr_in_fields = "\t/* no tstr chunk_in io */"
+        if not bstr_in_fields:
+            bstr_in_fields = "\t/* no bstr chunk_in io */"
+
+        return f"""/* Streaming io struct (internal, schema-wide). */
+struct cbor_stream_io {{
+	/* Text string fields (chunk_out) */
+{tstr_out_fields}
+
+	/* Byte string fields (chunk_out) */
+{bstr_out_fields}
+
+	/* Text string fields (chunk_in) */
+{tstr_in_fields}
+
+	/* Byte string fields (chunk_in) */
+{bstr_in_fields}
+}};"""
+
+    def render_stream_io_copy(self, entry):
+        repeats = self.collect_stream_iter_names_for_entry(entry)
+        tstr_pushes, bstr_pushes = self.collect_stream_chunk_names_for_entry(entry, "out")
+        fields = repeats + tstr_pushes + bstr_pushes
+        if not fields:
+            return "/* no streaming io for entry */"
+        return linesep.join([f"\t\tio_local.{name} = io->{name};" for name in fields])
+
+    def render_stream_io_decode_copy(self, entry):
+        tstr_pushes, bstr_pushes = self.collect_stream_chunk_names_for_entry(entry, "in")
+        fields = tstr_pushes + bstr_pushes
+        if not fields:
+            return "/* no streaming decode io for entry */"
+        return linesep.join([f"\t\tio_local.{name} = io->{name};" for name in fields])
+
+    def render_write_decls(self, mode):
+        if mode != "encode":
+            return ""
+        return (linesep * 2).join([
+            f"""int cbor_stream_encode_{xcoder.var_name(with_prefix=True, observe_skipped=False)}(
+		zcbor_stream_write_fn stream_write, void *stream_user_data,
+		const {xcoder.type_name() if struct_ptr_name(mode) in xcoder.full_xcode() else "void"} *input,
+		const {self.stream_io_type_name(xcoder)} *io,
+		size_t *bytes_written_out);"""
+            for xcoder in self.entry_types[mode]
+        ])
+
+    def render_stream_decode_decls(self, mode):
+        if mode != "decode":
+            return ""
+        return (linesep * 2).join([
+            f"""int cbor_stream_decode_{xcoder.var_name(with_prefix=True, observe_skipped=False)}(
+		const uint8_t *payload, size_t payload_len,
+		{xcoder.type_name() if struct_ptr_name(mode) in xcoder.full_xcode() else "void"} *result,
+		const {self.stream_io_type_name(xcoder)} *io,
+		size_t *payload_len_out);"""
+            for xcoder in self.entry_types[mode]
+        ])
 
     def render_type_file(self, header_guard, mode):
         body = (
             linesep + linesep).join(
                 [f"{typedef[1]} {{{linesep}{linesep.join(typedef[0][1:])};"
                     for typedef in self.type_defs[mode]])
-        return \
+        if self.stream_encode_functions or self.stream_decode_functions:
+            default_max_qty_define = (
+                "#define ZCBOR_GENERATED_DEFAULT_MAX_QTY "
+                + str(self.default_max_qty)
+                + linesep
+                + linesep
+                + "/* Allow build-system override. */"
+                + linesep
+                + "#ifndef DEFAULT_MAX_QTY"
+                + linesep
+                + "#define DEFAULT_MAX_QTY ZCBOR_GENERATED_DEFAULT_MAX_QTY"
+                + linesep
+                + "#endif"
+                + linesep
+                + linesep
+                + "/* Allow build-system override for streaming state array size. */"
+                + linesep
+                + "#ifndef ZCBOR_STREAM_STATE_ARRAY_SIZE"
+                + linesep
+                + "#define ZCBOR_STREAM_STATE_ARRAY_SIZE 8"
+                + linesep
+                + "#endif"
+            )
+        else:
+            default_max_qty_define = "#define DEFAULT_MAX_QTY " + str(self.default_max_qty)
+        indef_strings_define = ""
+        return (
             f"""/*{self.render_file_header(" *")}
  */
 
@@ -2913,7 +3717,7 @@ extern "C" {{
  *
  *  See `zcbor --help` for more information about --default-max-qty
  */
-#define DEFAULT_MAX_QTY {self.default_max_qty}
+{default_max_qty_define}{indef_strings_define}
 
 {body}
 
@@ -2922,7 +3726,7 @@ extern "C" {{
 #endif
 
 #endif /* {header_guard} */
-"""
+""").rstrip() + "\n"
 
     def render_cmake_file(self, target_name, h_files, c_files, type_file,
                           output_c_dir, output_h_dir, cmake_dir):
@@ -2937,6 +3741,7 @@ extern "C" {{
             except ValueError:
                 # On Windows, the above will fail if the paths are on different drives.
                 return Path(p).absolute().as_posix()
+        cmake_defs = ""
         return \
             f"""\
 #{self.render_file_header("#")}
@@ -2953,7 +3758,8 @@ target_sources({target_name} PRIVATE
 target_include_directories({target_name} PUBLIC
     {(linesep + "    ").join(((str(relativify(f)) for f in include_dirs)))}
     )
-"""
+{cmake_defs}
+""".rstrip() + "\n"
 
     def render(self, modes, h_files, c_files, type_file, include_prefix, cmake_file=None,
                output_c_dir=None, output_h_dir=None):
@@ -3045,6 +3851,30 @@ The default_max_qty can usually be set to a text symbol if desired,
 to allow it to be configurable when building the code. This is not always
 possible, as sometimes the value is needed for internal computations.
 If so, the script will raise an exception.""")
+    code_parser.add_argument(
+        "--repeated-as-pointers", required=False, action="store_true", default=False,
+        help="""Represent repeated fields (max_qty > 1) as pointer + count instead of embedding a
+fixed-size array in the generated types.
+
+This can significantly reduce the size of top-level unions/structs at the cost of requiring the
+caller to provide storage for decode, and a readable array for encode.""")
+    code_parser.add_argument(
+        "--stream-encode", required=False,
+        action="store_true", default=False, dest="stream_encode_functions",
+        help="""Also generate streaming encode entrypoints (cbor_stream_encode_<type>) for each
+entry type.
+These use zcbor_new_encode_state_streaming() and are intended for low-RAM UART write paths.
+
+Streaming encode entrypoints support:
+  - repeated fields via zcbor_multi_encode_iter_minmax() (iterator callback)
+  - tstr/bstr fields via chunk callbacks""")
+    code_parser.add_argument(
+        "--stream-decode", required=False,
+        action="store_true", default=False, dest="stream_decode_functions",
+        help="""Also generate streaming decode entrypoints (cbor_stream_decode_<type>) for each
+entry type.
+These use zcbor_tstr_chunk_in()/zcbor_bstr_chunk_in() callbacks and allow
+indefinite-length tstr/bstr values to be processed without reassembly.""")
     code_parser.add_argument(
         "--output-c", "--oc", required=False, type=str,
         help="""Path to output C file. If both --decode and --encode are specified, _decode and
@@ -3205,6 +4035,8 @@ def process_code(args):
 
     if args.file_header and Path(args.file_header).exists():
         args.file_header = Path(args.file_header).read_text(encoding="utf-8")
+    elif args.file_header:
+        args.file_header = args.file_header.replace("\\n", "\n")
 
     print("Parsing files: " + ", ".join((c.name for c in args.cddl)))
 
@@ -3214,7 +4046,9 @@ def process_code(args):
     for mode in modes:
         cddl_res[mode] = CodeGenerator.from_cddl(
             mode, cddl_contents, args.default_max_qty, mode, args.entry_types,
-            args.default_bit_size, short_names=args.short_names)
+            args.default_bit_size, args.repeated_as_pointers,
+            args.stream_encode_functions, args.stream_decode_functions,
+            short_names=args.short_names)
 
     # Parsing is done, pretty print the result.
     verbose_print(args.verbose, "Parsed CDDL types:")
@@ -3265,12 +4099,19 @@ def process_code(args):
         or (args.output_h and Path(args.output_h).with_name(Path(args.output_h).stem + "_types.h"))
         or Path(cmake_dir, 'include', filenames + '_types.h'))
 
-    renderer = CodeRenderer(entry_types={mode: [cddl_res[mode].my_types[entry]
-                                         for entry in args.entry_types] for mode in modes},
-                            modes=modes, print_time=args.time_header,
-                            default_max_qty=args.default_max_qty, git_sha=git_sha,
-                            file_header=args.file_header
-                            )
+    renderer = CodeRenderer(
+        entry_types={
+            mode: [cddl_res[mode].my_types[entry] for entry in args.entry_types]
+            for mode in modes
+        },
+        modes=modes,
+        print_time=args.time_header,
+        default_max_qty=args.default_max_qty,
+        git_sha=git_sha,
+        file_header=args.file_header,
+        stream_encode_functions=args.stream_encode_functions,
+        stream_decode_functions=args.stream_decode_functions,
+    )
 
     c_code_dir = C_SRC_PATH
     h_code_dir = C_INCLUDE_PATH
@@ -3289,7 +4130,6 @@ def process_code(args):
         copyfile(Path(h_code_dir, "zcbor_print.h"), Path(new_h_code_dir, "zcbor_print.h"))
         c_code_dir = new_c_code_dir
         h_code_dir = new_h_code_dir
-
     renderer.render(modes, output_h, output_c, output_h_types, args.include_prefix,
                     output_cmake, c_code_dir, h_code_dir)
 

@@ -6,9 +6,32 @@
 
 #include <zcbor_encode.h>
 #include <stdio.h>
+#include <string.h>
 #include <pet_decode.h>
 #include <pet_encode.h>
 #include <pet1.h>
+
+struct stream_ctx {
+	uint8_t *buf;
+	size_t size;
+	size_t pos;
+};
+
+static size_t stream_write(void *user_data, const uint8_t *data, size_t len)
+{
+	struct stream_ctx *ctx = (struct stream_ctx *)user_data;
+
+	if (!ctx || !data || len == 0) {
+		return 0;
+	}
+	if (ctx->pos + len > ctx->size) {
+		return 0;
+	}
+
+	memcpy(&ctx->buf[ctx->pos], data, len);
+	ctx->pos += len;
+	return len;
+}
 
 static void print_pet(const struct Pet *pet)
 {
@@ -120,10 +143,52 @@ static void get_pet3(void)
 	print_pet(&decoded_pet);
 }
 
+/** Fourth pet - encoded with zcbor-generated streaming entrypoint. */
+static void get_pet4_streaming(void)
+{
+	struct Pet decoded_pet;
+	struct Pet encoded_pet;
+	int err;
+	uint8_t pet4[30];
+	size_t out_len = 0;
+	struct stream_ctx ctx = {
+		.buf = pet4,
+		.size = sizeof(pet4),
+		.pos = 0,
+	};
+	const uint8_t first_name[] = "Sammy";
+	const uint8_t last_name[] = "Streaming";
+	const uint8_t timestamp4[] = { 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22 };
+
+	encoded_pet.names[0].value = first_name;
+	encoded_pet.names[0].len = sizeof(first_name) - 1;
+	encoded_pet.names[1].value = last_name;
+	encoded_pet.names[1].len = sizeof(last_name) - 1;
+	encoded_pet.names_count = 2;
+	encoded_pet.birthday.value = timestamp4;
+	encoded_pet.birthday.len = sizeof(timestamp4);
+	encoded_pet.species_choice = Pet_species_cat_c;
+
+	err = cbor_stream_encode_Pet(stream_write, &ctx, &encoded_pet, NULL, &out_len);
+	if (err != ZCBOR_SUCCESS || out_len != ctx.pos) {
+		printf("Streaming encode failed for pet4: %d\r\n", err);
+		return;
+	}
+
+	err = cbor_decode_Pet(pet4, out_len, &decoded_pet, NULL);
+	if (err != ZCBOR_SUCCESS) {
+		printf("Decoding failed for pet4: %d\r\n", err);
+		return;
+	}
+
+	print_pet(&decoded_pet);
+}
+
 int main(void)
 {
 	get_pet1();
 	get_pet2();
 	get_pet3();
+	get_pet4_streaming();
 	return 0;
 }

@@ -12,6 +12,128 @@
 #endif
 #include <common_test.h>
 
+#ifdef STREAMING
+#include <string.h>
+
+struct stream_ctx {
+	uint8_t *buf;
+	size_t size;
+	size_t pos;
+};
+
+static size_t stream_write(void *user_data, const uint8_t *data, size_t len)
+{
+	struct stream_ctx *ctx = (struct stream_ctx *)user_data;
+
+	if (!ctx || !data) {
+		return 0;
+	}
+	if (len == 0) {
+		return 0;
+	}
+	if (ctx->pos + len > ctx->size) {
+		return 0;
+	}
+
+	memcpy(&ctx->buf[ctx->pos], data, len);
+	ctx->pos += len;
+	return len;
+}
+
+#define STREAM_ENCODE_WRAPPER(func, type) \
+static int stream_encode_##func(uint8_t *payload, size_t payload_len, \
+		const type *input, size_t *out_len) \
+{ \
+	struct stream_ctx ctx = { \
+		.buf = payload, \
+		.size = payload_len, \
+		.pos = 0, \
+	}; \
+	int rc = cbor_stream_encode_##func(stream_write, &ctx, input, NULL, out_len); \
+	if (rc == ZCBOR_SUCCESS) { \
+		zassert_equal(*out_len, ctx.pos, NULL); \
+	} \
+	return rc; \
+}
+
+STREAM_ENCODE_WRAPPER(NestedListMap, struct NestedListMap)
+STREAM_ENCODE_WRAPPER(NestedMapListMap, struct NestedMapListMap)
+STREAM_ENCODE_WRAPPER(Numbers, struct Numbers)
+STREAM_ENCODE_WRAPPER(Numbers2, struct Numbers2)
+STREAM_ENCODE_WRAPPER(NumberMap, struct NumberMap)
+STREAM_ENCODE_WRAPPER(TaggedUnion, struct TaggedUnion_r)
+STREAM_ENCODE_WRAPPER(Strings, struct Strings)
+STREAM_ENCODE_WRAPPER(Simple2, struct Simples)
+STREAM_ENCODE_WRAPPER(Optional, struct Optional)
+STREAM_ENCODE_WRAPPER(Union, struct Union_r)
+STREAM_ENCODE_WRAPPER(Map, struct Map)
+STREAM_ENCODE_WRAPPER(Level1, struct Level2)
+STREAM_ENCODE_WRAPPER(Range, struct Range)
+STREAM_ENCODE_WRAPPER(ValueRange, struct ValueRange)
+STREAM_ENCODE_WRAPPER(SingleBstr, struct zcbor_string)
+STREAM_ENCODE_WRAPPER(SingleInt_uint52, void)
+STREAM_ENCODE_WRAPPER(SingleInt2, uint32_t)
+STREAM_ENCODE_WRAPPER(Unabstracted, struct Unabstracted)
+STREAM_ENCODE_WRAPPER(QuantityRange, struct QuantityRange)
+STREAM_ENCODE_WRAPPER(DoubleMap, struct DoubleMap)
+STREAM_ENCODE_WRAPPER(Floats, struct Floats)
+STREAM_ENCODE_WRAPPER(Floats2, struct Floats2)
+STREAM_ENCODE_WRAPPER(CBORBstr, struct CBORBstr)
+STREAM_ENCODE_WRAPPER(MapLength, struct MapLength)
+STREAM_ENCODE_WRAPPER(UnionInt2, struct UnionInt2)
+STREAM_ENCODE_WRAPPER(Intmax1, void)
+STREAM_ENCODE_WRAPPER(Intmax2, struct Intmax2)
+STREAM_ENCODE_WRAPPER(InvalidIdentifiers, struct InvalidIdentifiers)
+STREAM_ENCODE_WRAPPER(MapUnionPrimAlias, struct MapUnionPrimAlias)
+STREAM_ENCODE_WRAPPER(EmptyContainer, struct EmptyContainer)
+STREAM_ENCODE_WRAPPER(SingleElemList, struct SingleElemList)
+STREAM_ENCODE_WRAPPER(Choice1, struct Choice1_r)
+STREAM_ENCODE_WRAPPER(Choice2, struct Choice2_r)
+STREAM_ENCODE_WRAPPER(Choice3, struct Choice3_r)
+STREAM_ENCODE_WRAPPER(Choice4, struct Choice4_r)
+STREAM_ENCODE_WRAPPER(Choice5, struct Choice5_r)
+STREAM_ENCODE_WRAPPER(OptList, struct OptList)
+
+#undef STREAM_ENCODE_WRAPPER
+
+#define cbor_encode_NestedListMap stream_encode_NestedListMap
+#define cbor_encode_NestedMapListMap stream_encode_NestedMapListMap
+#define cbor_encode_Numbers stream_encode_Numbers
+#define cbor_encode_Numbers2 stream_encode_Numbers2
+#define cbor_encode_NumberMap stream_encode_NumberMap
+#define cbor_encode_TaggedUnion stream_encode_TaggedUnion
+#define cbor_encode_Strings stream_encode_Strings
+#define cbor_encode_Simple2 stream_encode_Simple2
+#define cbor_encode_Optional stream_encode_Optional
+#define cbor_encode_Union stream_encode_Union
+#define cbor_encode_Map stream_encode_Map
+#define cbor_encode_Level1 stream_encode_Level1
+#define cbor_encode_Range stream_encode_Range
+#define cbor_encode_ValueRange stream_encode_ValueRange
+#define cbor_encode_SingleBstr stream_encode_SingleBstr
+#define cbor_encode_SingleInt_uint52 stream_encode_SingleInt_uint52
+#define cbor_encode_SingleInt2 stream_encode_SingleInt2
+#define cbor_encode_Unabstracted stream_encode_Unabstracted
+#define cbor_encode_QuantityRange stream_encode_QuantityRange
+#define cbor_encode_DoubleMap stream_encode_DoubleMap
+#define cbor_encode_Floats stream_encode_Floats
+#define cbor_encode_Floats2 stream_encode_Floats2
+#define cbor_encode_CBORBstr stream_encode_CBORBstr
+#define cbor_encode_MapLength stream_encode_MapLength
+#define cbor_encode_UnionInt2 stream_encode_UnionInt2
+#define cbor_encode_Intmax1 stream_encode_Intmax1
+#define cbor_encode_Intmax2 stream_encode_Intmax2
+#define cbor_encode_InvalidIdentifiers stream_encode_InvalidIdentifiers
+#define cbor_encode_MapUnionPrimAlias stream_encode_MapUnionPrimAlias
+#define cbor_encode_EmptyContainer stream_encode_EmptyContainer
+#define cbor_encode_SingleElemList stream_encode_SingleElemList
+#define cbor_encode_Choice1 stream_encode_Choice1
+#define cbor_encode_Choice2 stream_encode_Choice2
+#define cbor_encode_Choice3 stream_encode_Choice3
+#define cbor_encode_Choice4 stream_encode_Choice4
+#define cbor_encode_Choice5 stream_encode_Choice5
+#define cbor_encode_OptList stream_encode_OptList
+#endif /* STREAMING */
 
 ZTEST(cbor_encode_test3, test_numbers)
 {

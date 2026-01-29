@@ -22,6 +22,11 @@ set(py_command
   --file-header ${CMAKE_CURRENT_LIST_DIR}/file_header_copyright.txt
   )
 
+if (STREAMING)
+  zephyr_compile_definitions(STREAMING)
+  list(APPEND py_command --stream-encode)
+endif()
+
 execute_process(
   COMMAND ${py_command}
   COMMAND_ERROR_IS_FATAL ANY
@@ -31,4 +36,3 @@ include(${PROJECT_BINARY_DIR}/pet.cmake)
 
 target_link_libraries(pet PRIVATE zephyr_interface)
 target_link_libraries(app PRIVATE pet)
-

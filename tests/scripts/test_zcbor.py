@@ -764,6 +764,37 @@ class TestIntmax(TestCase):
         self.assertEqual(decoded.UINT_64, 18446744073709551615)
 
 
+class TestLabelKeyContext(TestCase):
+    def test_list_label_does_not_become_key_when_type_exists(self):
+        cddl_str = """
+foo = 2
+
+my_list = [
+  foo: uint
+]
+"""
+        cddl_res = zcbor.DataTranslator.from_cddl(cddl_str, 16)
+        cddl = cddl_res.my_types["my_list"]
+        self.assertEqual("LIST", cddl.type)
+        child = cddl.value[0]
+        self.assertEqual("foo", child.label)
+        self.assertIsNone(child.key)
+
+    def test_map_member_still_uses_key_when_type_exists(self):
+        cddl_str = """
+foo = 2
+
+my_map = {
+  foo: uint
+}
+"""
+        cddl_res = zcbor.DataTranslator.from_cddl(cddl_str, 16)
+        cddl = cddl_res.my_types["my_map"]
+        self.assertEqual("MAP", cddl.type)
+        child = cddl.value[0]
+        self.assertIsNotNone(child.key)
+
+
 class TestInvalidIdentifiers(TestCase):
     def test_invalid_identifiers0(self):
         cddl_res = zcbor.DataTranslator.from_cddl(

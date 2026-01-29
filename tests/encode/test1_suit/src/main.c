@@ -9,6 +9,70 @@
 #include "manifest3_encode.h"
 #include "zcbor_print.h"
 
+#ifdef STREAMING
+#include <string.h>
+
+struct stream_ctx {
+	uint8_t *buf;
+	size_t size;
+	size_t pos;
+};
+
+static size_t stream_write(void *user_data, const uint8_t *data, size_t len)
+{
+	struct stream_ctx *ctx = (struct stream_ctx *)user_data;
+
+	if (!ctx || !data) {
+		return 0;
+	}
+	if (len == 0) {
+		return 0;
+	}
+	if (ctx->pos + len > ctx->size) {
+		return 0;
+	}
+
+	memcpy(&ctx->buf[ctx->pos], data, len);
+	ctx->pos += len;
+	return len;
+}
+
+static int stream_encode_SUIT_Command_Sequence(uint8_t *payload, size_t payload_len,
+		const struct SUIT_Command_Sequence *input, size_t *out_len)
+{
+	struct stream_ctx ctx = {
+		.buf = payload,
+		.size = payload_len,
+		.pos = 0,
+	};
+	int rc = cbor_stream_encode_SUIT_Command_Sequence(stream_write, &ctx, input, NULL, out_len);
+
+	if (rc == ZCBOR_SUCCESS) {
+		zassert_equal(*out_len, ctx.pos, NULL);
+	}
+	return rc;
+}
+
+static int stream_encode_SUIT_Outer_Wrapper(uint8_t *payload, size_t payload_len,
+		const struct SUIT_Outer_Wrapper *input, size_t *out_len)
+{
+	struct stream_ctx ctx = {
+		.buf = payload,
+		.size = payload_len,
+		.pos = 0,
+	};
+	int rc = cbor_stream_encode_SUIT_Outer_Wrapper(stream_write, &ctx, input, NULL, out_len);
+
+	if (rc == ZCBOR_SUCCESS) {
+		zassert_equal(*out_len, ctx.pos, NULL);
+	}
+	return rc;
+}
+
+#define cbor_encode_SUIT_Command_Sequence stream_encode_SUIT_Command_Sequence
+#define cbor_encode_SUIT_Outer_Wrapper stream_encode_SUIT_Outer_Wrapper
+#endif /* STREAMING */
+
 /* draft-ietf-suit-manifest-02 Example 0 */
 uint8_t test_vector0_02[] = {
 	0xa2, 0x01, 0x58, 0x54, 0xd2, 0x84, 0x43, 0xa1, 0x01,
