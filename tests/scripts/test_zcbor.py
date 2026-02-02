@@ -673,6 +673,140 @@ file header"""
         self.do_test_file_header(from_file=True)
 
 
+class TestCppCodeGeneration(PopenTest):
+    """Tests for the --cpp flag that generates C++ enum class code."""
+
+    def test_cpp_flag_accepted(self):
+        """Verify the --cpp flag is accepted by the CLI."""
+        tempd = Path(mkdtemp())
+        try:
+            self.popen_test([
+                "zcbor", "code",
+                "--cddl", str(p_pet_cddl),
+                "-t", "Pet",
+                "-e",
+                "--cpp",
+                "--output-c", str(tempd / "pet.cpp"),
+                "--output-h", str(tempd / "pet.hpp"),
+                "--output-h-types", str(tempd / "pet_types.hpp"),
+            ], "")
+            self.assertTrue((tempd / "pet.cpp").exists())
+            self.assertTrue((tempd / "pet.hpp").exists())
+            self.assertTrue((tempd / "pet_types.hpp").exists())
+        finally:
+            rmtree(tempd)
+
+    def test_cpp_generates_enum_class(self):
+        """Verify --cpp generates enum class instead of anonymous enum."""
+        tempd = Path(mkdtemp())
+        try:
+            self.popen_test([
+                "zcbor", "code",
+                "--cddl", str(p_pet_cddl),
+                "-t", "Pet",
+                "-e",
+                "--cpp",
+                "--short-names",
+                "--output-c", str(tempd / "pet.cpp"),
+                "--output-h", str(tempd / "pet.hpp"),
+                "--output-h-types", str(tempd / "pet_types.hpp"),
+            ], "")
+
+            types_content = (tempd / "pet_types.hpp").read_text(encoding="utf-8")
+
+            # Verify enum class syntax is used
+            self.assertIn("enum class", types_content)
+            # Verify C-compatible headers are used (stdint.h works in both C and C++)
+            self.assertIn("#include <stdint.h>", types_content)
+            self.assertIn("#include <stddef.h>", types_content)
+            # Verify no extern "C" wrapper
+            self.assertNotIn('extern "C"', types_content)
+            # Verify no anonymous enum inside struct
+            self.assertNotIn("enum {", types_content)
+
+            # Verify encoder uses scoped enum access
+            cpp_content = (tempd / "pet.cpp").read_text(encoding="utf-8")
+            self.assertIn("#include <stdint.h>", cpp_content)
+            # The enum class name should appear with :: scope operator
+            self.assertIn("::", cpp_content)
+        finally:
+            rmtree(tempd)
+
+    def test_cpp_vs_c_output_differs(self):
+        """Verify --cpp generates different output than default C mode."""
+        tempd = Path(mkdtemp())
+        try:
+            # Generate C code
+            self.popen_test([
+                "zcbor", "code",
+                "--cddl", str(p_pet_cddl),
+                "-t", "Pet",
+                "-e",
+                "--short-names",
+                "--output-c", str(tempd / "pet_c.c"),
+                "--output-h", str(tempd / "pet_c.h"),
+                "--output-h-types", str(tempd / "pet_types_c.h"),
+            ], "")
+
+            # Generate C++ code
+            self.popen_test([
+                "zcbor", "code",
+                "--cddl", str(p_pet_cddl),
+                "-t", "Pet",
+                "-e",
+                "--cpp",
+                "--short-names",
+                "--output-c", str(tempd / "pet_cpp.cpp"),
+                "--output-h", str(tempd / "pet_cpp.hpp"),
+                "--output-h-types", str(tempd / "pet_types_cpp.hpp"),
+            ], "")
+
+            c_types = (tempd / "pet_types_c.h").read_text(encoding="utf-8")
+            cpp_types = (tempd / "pet_types_cpp.hpp").read_text(encoding="utf-8")
+
+            # C should have anonymous enum, C++ should have enum class
+            self.assertIn("enum {", c_types)
+            self.assertNotIn("enum class", c_types)
+            self.assertIn("enum class", cpp_types)
+            self.assertNotIn("enum {", cpp_types)
+
+            # C should have extern "C", C++ should not
+            self.assertIn('extern "C"', c_types)
+            self.assertNotIn('extern "C"', cpp_types)
+        finally:
+            rmtree(tempd)
+
+    @skipIf(platform == "win32", "g++ may not be available on Windows")
+    def test_cpp_code_compiles(self):
+        """Verify generated C++ code compiles with g++ -std=c++11."""
+        tempd = Path(mkdtemp())
+        try:
+            self.popen_test([
+                "zcbor", "code",
+                "--cddl", str(p_pet_cddl),
+                "-t", "Pet",
+                "-e",
+                "--cpp",
+                "--short-names",
+                "--output-c", str(tempd / "pet.cpp"),
+                "--output-h", str(tempd / "pet.hpp"),
+                "--output-h-types", str(tempd / "pet_types.hpp"),
+            ], "")
+
+            # Try to compile with g++
+            zcbor_include = str(p_root / "include")
+            stdout, stderr = self.popen_test([
+                "g++", "-std=c++11", "-c",
+                str(tempd / "pet.cpp"),
+                "-I", str(tempd),
+                "-I", zcbor_include,
+                "-o", str(tempd / "pet.o"),
+            ], "")
+            self.assertTrue((tempd / "pet.o").exists())
+        finally:
+            rmtree(tempd)
+
+
 class TestOptional(TestCase):
     def test_optional_0(self):
         with open(p_optional, 'r', encoding="utf-8") as f:
