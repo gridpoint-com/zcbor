@@ -472,7 +472,7 @@ usage: zcbor code [-h] -c CDDL [--no-prelude] [-v]
                   -t ENTRY_TYPES [ENTRY_TYPES ...] [-d] [-e] [--time-header]
                   [--git-sha-header] [-b {32,64}]
                   [--include-prefix INCLUDE_PREFIX] [-s]
-                  [--file-header FILE_HEADER]
+                  [--file-header FILE_HEADER] [--cpp]
 
 Parse a CDDL file and produce C code that validates and xcodes CBOR.
 The output from this script is a C file and a header file. The header file
@@ -592,6 +592,11 @@ options:
                         generated files, e.g. copyright. Can be a string or a
                         path to a file. If interpreted as a path to an
                         existing file, the file's contents will be used.
+  --cpp                 Generate C++ code with enum class instead of anonymous
+                        enums. This produces type-safe scoped enums (e.g.,
+                        MyType::value instead of MyType_value_c). Requires
+                        C++11 or later. Output files will use .cpp extension
+                        instead of .c.
 
 ```
 

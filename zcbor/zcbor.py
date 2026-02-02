@@ -215,7 +215,7 @@ class CddlParser:
     - For "GROUP" and "UNION" types, there is no separate data item for the instance.
     """
     def __init__(self, default_max_qty, my_types, my_control_groups, base_name=None,
-                 short_names=False, base_stem='', in_map=False):
+                 short_names=False, base_stem='', in_map=False, cpp_mode=False):
         self.id_prefix = "temp_" + str(counter())
         self.id_num = None  # Unique ID number. Only populated if needed.
         # The value of the data item. Has different meaning for different
@@ -264,6 +264,7 @@ class CddlParser:
         self.base_stem = base_stem.replace("-", "_")
         self.short_names = short_names
         self.in_map = in_map
+        self.cpp_mode = cpp_mode
 
         if type(self) not in type(self).cddl_regexes:
             self.cddl_regexes_init()
@@ -439,7 +440,7 @@ class CddlParser:
         """Return the kwargs that should be used to initialize a new instance of this class."""
         return {
             "my_types": self.my_types, "my_control_groups": self.my_control_groups,
-            "short_names": self.short_names, "in_map": self.in_map}
+            "short_names": self.short_names, "in_map": self.in_map, "cpp_mode": self.cpp_mode}
 
     def set_id_prefix(self, id_prefix=''):
         self.id_prefix = id_prefix
@@ -1367,12 +1368,25 @@ class CddlXcoder(CddlParser):
 
     def enum_var_name(self):
         """Name of the enum entry for this element."""
+        if self.cpp_mode:
+            # In C++ mode, use shorter names since enum class provides scoping
+            return self.var_name()
         return self.var_name(with_prefix=True) + "_c"
 
     def enum_var(self, int_val=False):
         """Enum entry for this element."""
         return f"{self.enum_var_name()} = {val_to_str(self.int_val())}" \
                if int_val else self.enum_var_name()
+
+    def scoped_enum_var_name(self, parent_union):
+        """Get the scoped enum value name for use in generated code.
+
+        In C++ mode, returns 'EnumType::value'. In C mode, returns 'value_c'.
+        parent_union is the UNION element that contains this child.
+        """
+        if self.cpp_mode:
+            return f"{parent_union.enum_type_name_cpp()}::{self.enum_var_name()}"
+        return self.enum_var_name()
 
     def choice_var_access(self):
         """Full "path" of the "choice" variable for this element."""
@@ -1948,6 +1962,9 @@ class CodeGenerator(CddlXcoder):
     def anonymous_choice_var(self):
         """Declaration of the "choice" variable for this element."""
         int_vals = self.all_children_int_disambiguated()
+        if self.cpp_mode:
+            # In C++ mode, reference the separate enum class type
+            return [self.enum_type_name_cpp()]
         return self.enclose("enum", [val.enum_var(int_vals) + "," for val in self.value])
 
     def choice_var(self):
@@ -1984,6 +2001,10 @@ class CodeGenerator(CddlXcoder):
 
     def enum_type_name(self):
         return "enum %s" % self.id()
+
+    def enum_type_name_cpp(self):
+        """Name of the enum class type in C++ mode (without 'enum class' prefix)."""
+        return self.id()
 
     def bit_size(self):
         """The bit width of the integers as represented in code."""
@@ -2206,6 +2227,9 @@ class CodeGenerator(CddlXcoder):
             ret_val.extend(self.key.type_def())
         if self.type == "OTHER":
             ret_val.extend(self.my_types[self.value].type_def())
+        # In C++ mode, emit enum class definitions for UNION types before the struct
+        if self.cpp_mode and self.type == "UNION" and self.all_children_int_disambiguated():
+            ret_val.extend(self.enum_class_type_def())
         if self.repeated_type_def_condition():
             type_def_list = self.single_var_type(full=False)
             if type_def_list:
@@ -2219,6 +2243,21 @@ class CodeGenerator(CddlXcoder):
     def type_def_bits(self):
         tdef = self.anonymous_choice_var()
         return [(tdef, self.enum_type_name())]
+
+    def enum_class_type_def(self):
+        """Generate enum class type definition for C++ mode.
+
+        Returns a list of (body_lines, type_name) tuples for enum class definitions.
+        Only returns non-empty when this is a UNION type and cpp_mode is True.
+        """
+        if not self.cpp_mode or self.type != "UNION":
+            return []
+        int_vals = self.all_children_int_disambiguated()
+        enum_name = self.enum_type_name_cpp()
+        values = [f"    {val.enum_var_name()} = {val_to_str(val.int_val())},"
+                  for val in self.value]
+        body = [f"enum class {enum_name} : int {{"] + values + ["}"]
+        return [(body, f"enum class {enum_name}")]
 
     def float_prefix(self):
         if self.type != "FLOAT":
@@ -2530,7 +2569,7 @@ class CodeGenerator(CddlXcoder):
                 lines = []
                 lines.extend(
                     ["((%s == %s) && (%s))" %
-                        (self.choice_var_access(), child.enum_var_name(),
+                        (self.choice_var_access(), child.scoped_enum_var_name(self),
                             child.full_xcode(union_int="DROP"))
                         for child in self.value])
                 bit_size = self.value[0].bit_size()
@@ -2545,7 +2584,7 @@ class CodeGenerator(CddlXcoder):
             child_values = ["(%s && ((%s = %s), true))" %
                             (child.full_xcode(
                                 union_int="EXPECT" if child.is_int_disambiguated() else None),
-                                self.choice_var_access(), child.enum_var_name())
+                                self.choice_var_access(), child.scoped_enum_var_name(self))
                             for child in self.value]
 
             # Reset state for all but the first child.
@@ -2561,7 +2600,7 @@ class CodeGenerator(CddlXcoder):
         else:
             return ternary_if_chain(
                 self.choice_var_access(),
-                [child.enum_var_name() for child in self.value],
+                [child.scoped_enum_var_name(self) for child in self.value],
                 [child.full_xcode() for child in self.value])
 
     def xcode_bstr_streaming(self):
@@ -2865,12 +2904,13 @@ class CodeGenerator(CddlXcoder):
 
 class CodeRenderer():
     def __init__(self, entry_types, modes, print_time, default_max_qty, git_sha='', file_header='',
-                 stream_encode_functions=False, stream_decode_functions=False):
+                 stream_encode_functions=False, stream_decode_functions=False, cpp_mode=False):
         self.entry_types = entry_types
         self.print_time = print_time
         self.default_max_qty = default_max_qty
         self.stream_encode_functions = stream_encode_functions
         self.stream_decode_functions = stream_decode_functions
+        self.cpp_mode = cpp_mode
         self.sorted_types = dict()
         self.functions = dict()
         self.type_defs = dict()
@@ -3128,13 +3168,16 @@ do { \\
             else "DEFAULT_MAX_QTY"
         )
 
+        # Use C headers (work in both C and C++ mode, and don't require full libcpp)
+        includes = """#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <string.h>"""
+
         return (f"""/*{self.render_file_header(" *")}
  */
 
-#include <stdint.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <string.h>
+{includes}
 #include "zcbor_{mode}.h"
 #include "{header_file_name}"
 #include "zcbor_print.h"
@@ -3232,8 +3275,43 @@ do { \\
             write_includes = '#include "zcbor_encode.h"\n#include "zcbor_decode.h"'
         else:
             write_includes = ""
-        return (
-            f"""/*{self.render_file_header(" *")}
+
+        # Use C headers (work in C++ mode without requiring full libcpp)
+        if self.cpp_mode:
+            includes = f"""#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+{write_includes}
+#include "{type_def_file}" """
+            return (
+                f"""/*{self.render_file_header(" *")}
+ */
+
+#ifndef {header_guard}
+#define {header_guard}
+
+{includes}
+
+#if {"ZCBOR_GENERATED_DEFAULT_MAX_QTY" if (self.stream_encode_functions or self.stream_decode_functions) else "DEFAULT_MAX_QTY"} != {self.default_max_qty}
+#error "The type file was generated with a different default_max_qty than this file"
+#endif
+
+{(linesep * 2).join([f"{xcoder.public_xcode_func_sig()};" for xcoder in self.entry_types[mode]])}
+
+{self.render_write_types(mode) if self.stream_encode_functions and mode == "encode" else ""}
+
+{self.render_write_decls(mode) if self.stream_encode_functions and mode == "encode" else ""}
+
+{self.render_decode_types(mode) if self.stream_decode_functions and mode == "decode" else ""}
+
+{self.render_stream_decode_decls(mode) if self.stream_decode_functions and mode == "decode" else ""}
+
+
+#endif /* {header_guard} */
+""").rstrip() + "\n"
+        else:
+            return (
+                f"""/*{self.render_file_header(" *")}
  */
 
 #ifndef {header_guard}
@@ -3664,10 +3742,19 @@ struct cbor_stream_io {{
         ])
 
     def render_type_file(self, header_guard, mode):
-        body = (
-            linesep + linesep).join(
-                [f"{typedef[1]} {{{linesep}{linesep.join(typedef[0][1:])};"
-                    for typedef in self.type_defs[mode]])
+        # In C++ mode, enum class definitions are standalone (not wrapped in struct braces)
+        body_parts = []
+        for typedef in self.type_defs[mode]:
+            type_name = typedef[1]
+            type_body = typedef[0]
+            if self.cpp_mode and type_name.startswith("enum class "):
+                # enum class definitions are already complete, just add semicolon
+                body_parts.append(linesep.join(type_body) + ";")
+            else:
+                # struct definitions need the opening brace format
+                body_parts.append(f"{type_name} {{{linesep}{linesep.join(type_body[1:])};")
+        body = (linesep + linesep).join(body_parts)
+
         if self.stream_encode_functions or self.stream_decode_functions:
             default_max_qty_define = (
                 "#define ZCBOR_GENERATED_DEFAULT_MAX_QTY "
@@ -3694,8 +3781,38 @@ struct cbor_stream_io {{
         else:
             default_max_qty_define = "#define DEFAULT_MAX_QTY " + str(self.default_max_qty)
         indef_strings_define = ""
-        return (
-            f"""/*{self.render_file_header(" *")}
+
+        # In C++ mode, use C headers (no full libcpp required) and no extern "C" wrapper
+        if self.cpp_mode:
+            includes = """#include <stdint.h>
+#include <stddef.h>"""
+            if "struct zcbor_string" in body:
+                includes += linesep + "#include <zcbor_common.h>"
+            return (
+                f"""/*{self.render_file_header(" *")}
+ */
+
+#ifndef {header_guard}
+#define {header_guard}
+
+{includes}
+
+/** Which value for --default-max-qty this file was created with.
+ *
+ *  The define is used in the other generated file to do a build-time
+ *  compatibility check.
+ *
+ *  See `zcbor --help` for more information about --default-max-qty
+ */
+{default_max_qty_define}{indef_strings_define}
+
+{body}
+
+#endif /* {header_guard} */
+""").rstrip() + "\n"
+        else:
+            return (
+                f"""/*{self.render_file_header(" *")}
  */
 
 #ifndef {header_guard}
@@ -3942,6 +4059,11 @@ from the corresponding union members.""")
         help="""Header to be included in the comment at the top of generated files, e.g. copyright.
 Can be a string or a path to a file. If interpreted as a path to an existing file,
 the file's contents will be used.""")
+    code_parser.add_argument(
+        "--cpp", required=False, action="store_true", default=False,
+        help="""Generate C++ code with enum class instead of anonymous enums.
+This produces type-safe scoped enums (e.g., MyType::value instead of MyType_value_c).
+Requires C++11 or later. Output files will use .cpp extension instead of .c.""")
     code_parser.set_defaults(process=process_code)
 
     validate_parent_parser = ArgumentParser(add_help=False)
@@ -4048,7 +4170,7 @@ def process_code(args):
             mode, cddl_contents, args.default_max_qty, mode, args.entry_types,
             args.default_bit_size, args.repeated_as_pointers,
             args.stream_encode_functions, args.stream_decode_functions,
-            short_names=args.short_names)
+            short_names=args.short_names, cpp_mode=args.cpp)
 
     # Parsing is done, pretty print the result.
     verbose_print(args.verbose, "Parsed CDDL types:")
@@ -4079,6 +4201,10 @@ def process_code(args):
         name = Path(filename).stem + "_" + mode + Path(filename).suffix
         return Path(filename).with_name(name)
 
+    # Determine file extensions based on C++ mode
+    c_ext = ".cpp" if args.cpp else ".c"
+    h_ext = ".hpp" if args.cpp else ".h"
+
     output_c = dict()
     output_h = dict()
     out_c = args.output_c if (len(modes) == 1 and args.output_c) else None
@@ -4086,18 +4212,19 @@ def process_code(args):
     for mode in modes:
         output_c[mode] = create_and_open(
             out_c or add_mode_to_fname(
-                args.output_c or Path(cmake_dir, 'src', f'{filenames}.c'), mode))
+                args.output_c or Path(cmake_dir, 'src', f'{filenames}{c_ext}'), mode))
         output_h[mode] = create_and_open(
             out_h or add_mode_to_fname(
-                args.output_h or Path(cmake_dir, 'include', f'{filenames}.h'), mode))
+                args.output_h or Path(cmake_dir, 'include', f'{filenames}{h_ext}'), mode))
 
     out_c_parent = Path(output_c[modes[0]].name).parent
     out_h_parent = Path(output_h[modes[0]].name).parent
 
     output_h_types = create_and_open(
         args.output_h_types
-        or (args.output_h and Path(args.output_h).with_name(Path(args.output_h).stem + "_types.h"))
-        or Path(cmake_dir, 'include', filenames + '_types.h'))
+        or (args.output_h
+            and Path(args.output_h).with_name(Path(args.output_h).stem + f"_types{h_ext}"))
+        or Path(cmake_dir, 'include', filenames + f'_types{h_ext}'))
 
     renderer = CodeRenderer(
         entry_types={
@@ -4111,6 +4238,7 @@ def process_code(args):
         file_header=args.file_header,
         stream_encode_functions=args.stream_encode_functions,
         stream_decode_functions=args.stream_decode_functions,
+        cpp_mode=args.cpp,
     )
 
     c_code_dir = C_SRC_PATH
