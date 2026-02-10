@@ -1053,6 +1053,16 @@ class CddlXcoder(CddlParser):
         self.dependsOnCall = False
         self.skipped = False
 
+        # Streaming iterator path disambiguation.
+        # _stream_iter_ctx: temporary path prefix set during code generation so that
+        # a shared type referenced from multiple fields produces per-path function
+        # names and iterator field names.
+        self._stream_iter_ctx = None
+        # _multi_ref_iter_types: set of type names (CDDL names) that are referenced
+        # from more than one field and contain streaming iterators. Populated by
+        # CodeRenderer before code generation.
+        self._multi_ref_iter_types = set()
+
     def var_name(self, with_prefix=False, observe_skipped=True):
         """Name of variables and enum members for this element."""
         if (observe_skipped and self.skip_condition()
@@ -1064,6 +1074,61 @@ class CddlXcoder(CddlParser):
         elif name in c_keywords_underscore:
             name = "_" + name
         return name
+
+    def _has_stream_iters(self, visited=None):
+        """Check if this element or its descendants contain count_var elements (streaming iters)."""
+        if visited is None:
+            visited = set()
+        if id(self) in visited:
+            return False
+        visited.add(id(self))
+
+        if self.count_var_condition():
+            return True
+        if self.type in ["LIST", "MAP", "GROUP", "UNION"]:
+            if any(child._has_stream_iters(visited) for child in self.value):
+                return True
+        if self.cbor and self.cbor._has_stream_iters(visited):
+            return True
+        if self.key and self.key._has_stream_iters(visited):
+            return True
+        if self.type == "OTHER" and self.value in self.my_types:
+            return self.my_types[self.value]._has_stream_iters(visited)
+        return False
+
+    def _set_stream_iter_ctx_tree(self, ctx):
+        """Set stream iterator context on this element and its structural children.
+
+        Propagates to children of LIST/MAP/GROUP/UNION and to cbor/key sub-elements,
+        but intentionally does NOT follow OTHER type references (those are separate
+        type definitions that should keep their own context).
+        """
+        self._stream_iter_ctx = ctx
+        if self.type in ["LIST", "MAP", "GROUP", "UNION"]:
+            for child in self.value:
+                child._set_stream_iter_ctx_tree(ctx)
+        if self.cbor:
+            self.cbor._set_stream_iter_ctx_tree(ctx)
+        if self.key:
+            self.key._set_stream_iter_ctx_tree(ctx)
+
+    def _propagate_multi_ref_iter_types(self, multi_refs, visited=None):
+        """Recursively set _multi_ref_iter_types on this element and all reachable elements."""
+        if visited is None:
+            visited = set()
+        if id(self) in visited:
+            return
+        visited.add(id(self))
+        self._multi_ref_iter_types = multi_refs
+        if self.type in ["LIST", "MAP", "GROUP", "UNION"]:
+            for child in self.value:
+                child._propagate_multi_ref_iter_types(multi_refs, visited)
+        if self.cbor:
+            self.cbor._propagate_multi_ref_iter_types(multi_refs, visited)
+        if self.key:
+            self.key._propagate_multi_ref_iter_types(multi_refs, visited)
+        if self.type == "OTHER" and self.value in self.my_types:
+            self.my_types[self.value]._propagate_multi_ref_iter_types(multi_refs, visited)
 
     def stream_chunk_field_name(self, direction=None):
         """Field name for streaming chunk io, derived from map key path."""
@@ -2299,13 +2364,17 @@ class CodeGenerator(CddlXcoder):
 
     def xcode_func_name(self):
         """Name of the encoder/decoder function for this element."""
-        return f"{self.mode}_{self.var_name(with_prefix=True, observe_skipped=False)}"
+        base = self.var_name(with_prefix=True, observe_skipped=False)
+        if self._stream_iter_ctx:
+            return f"{self.mode}_{self._stream_iter_ctx}_{base}"
+        return f"{self.mode}_{base}"
 
     def repeated_xcode_func_name(self):
         """Name of the encoder/decoder function for the repeated part of this element."""
         base_name = self.var_name(with_prefix=True, observe_skipped=False)
         access_prefix = self.accessPrefix
         key_suffix = ""
+        ctx_prefix = f"{self._stream_iter_ctx}_" if self._stream_iter_ctx else ""
 
         if self.key and self.key.value is not None:
             key_value = getrp(r'[^a-zA-Z0-9_]').sub("_", str(self.key.value)).strip("_")
@@ -2317,9 +2386,9 @@ class CodeGenerator(CddlXcoder):
             access_name = access_name.replace("->", "_").replace(".", "_")
             access_name = getrp(r'[^a-zA-Z0-9_]').sub("_", access_name).strip("_")
             if access_name and access_name not in base_name:
-                return f"{self.mode}_repeated_{access_name}_{base_name}{key_suffix}"
+                return f"{self.mode}_repeated_{ctx_prefix}{access_name}_{base_name}{key_suffix}"
 
-        return f"{self.mode}_repeated_{base_name}{key_suffix}"
+        return f"{self.mode}_repeated_{ctx_prefix}{base_name}{key_suffix}"
 
     def single_func_prim_name(self, union_int=None, ptr_result=False):
         """Function name for xcoding this type, when it is a primitive type"""
@@ -2361,7 +2430,19 @@ class CodeGenerator(CddlXcoder):
             return (None, None)
 
         if self.type == "OTHER":
-            return self.my_types[self.value].single_func(access, union_int)
+            ref = self.my_types[self.value]
+            # For streaming encode: set path context on the referenced type so that
+            # its single_func returns the per-path function name.
+            if (self.mode == "encode"
+                    and self.stream_encode_functions
+                    and self.value in self._multi_ref_iter_types):
+                ctx = self.var_name(with_prefix=False, observe_skipped=False)
+                saved_ctx = ref._stream_iter_ctx
+                ref._stream_iter_ctx = ctx
+                result = ref.single_func(access, union_int)
+                ref._stream_iter_ctx = saved_ctx
+                return result
+            return ref.single_func(access, union_int)
 
         func_name = self.single_func_prim_name(union_int, ptr_result=ptr_result)
         if func_name is None:
@@ -2822,6 +2903,8 @@ class CodeGenerator(CddlXcoder):
             # Optional streaming encode: stream io iterator overrides pointer+count.
             if self.mode == "encode" and self.stream_encode_functions:
                 prov_name = self.var_name(with_prefix=True, observe_skipped=False)
+                if self._stream_iter_ctx:
+                    prov_name = f"{self._stream_iter_ctx}_{prov_name}"
                 prov_access = (
                     "((const struct cbor_stream_io *)"
                     "zcbor_get_stream_io(state))"
@@ -2876,8 +2959,21 @@ class CodeGenerator(CddlXcoder):
             for xcoder in self.key.xcoders():
                 yield xcoder
         if self.type == "OTHER" and self.value not in self.entry_type_names:
-            for xcoder in self.my_types[self.value].xcoders():
+            ref = self.my_types[self.value]
+            # For streaming encode: when an OTHER element references a type that is
+            # used from multiple fields and contains iterators, set a path context
+            # so the referenced type generates per-path function names and iterator
+            # field accesses.
+            ctx = None
+            if (self.mode == "encode"
+                    and self.stream_encode_functions
+                    and self.value in self._multi_ref_iter_types):
+                ctx = self.var_name(with_prefix=False, observe_skipped=False)
+                ref._set_stream_iter_ctx_tree(ctx)
+            for xcoder in ref.xcoders():
                 yield xcoder
+            if ctx is not None:
+                ref._set_stream_iter_ctx_tree(None)
         if self.repeated_single_func_impl_condition():
             yield XcoderTuple(
                 self.repeated_xcode(), self.repeated_xcode_func_name(), self.repeated_type_name())
@@ -2915,6 +3011,14 @@ class CodeRenderer():
         self.functions = dict()
         self.type_defs = dict()
 
+        # Compute and propagate multi-ref iterator type info before code generation
+        # so that per-field-path iterator names are produced for shared types.
+        if stream_encode_functions:
+            multi_refs = self._compute_multi_ref_iter_types()
+            for mode_entries in self.entry_types.values():
+                for entry in mode_entries:
+                    entry._propagate_multi_ref_iter_types(multi_refs)
+
         # Sort type definitions so the typedefs will come in the correct order in the header file
         # and the function in the correct order in the c file.
         for mode in modes:
@@ -2940,11 +3044,26 @@ Generated with a --default-max-qty of {self.default_max_qty}"""
         entry_name = xcoder.var_name(with_prefix=True, observe_skipped=False)
         return f"cbor_stream_io_{entry_name}"
 
-    def collect_stream_iter_names_for_entry(self, entry):
-        if not self.stream_encode_functions:
-            return []
+    def _compute_multi_ref_iter_types(self):
+        """Find CDDL type names that are referenced from more than one field and
+        contain streaming iterators.  Used to decide which types need per-field-path
+        iterator names.
 
-        repeats = set()
+        Only encode entries are considered because streaming iterators are an
+        encode-side feature.
+        """
+        multi_refs = set()
+        for entry in self.entry_types.get("encode", []):
+            counts = self._count_iter_type_refs(entry)
+            for type_name, count in counts.items():
+                if count > 1:
+                    multi_refs.add(type_name)
+        return multi_refs
+
+    @staticmethod
+    def _count_iter_type_refs(entry):
+        """Count how many OTHER elements reference each type that contains iters."""
+        counts = {}
         visited = set()
 
         def walk(elem):
@@ -2952,8 +3071,11 @@ Generated with a --default-max-qty of {self.default_max_qty}"""
                 return
             visited.add(id(elem))
 
-            if elem.count_var_condition():
-                repeats.add(elem.var_name(with_prefix=True, observe_skipped=False))
+            if elem.type == "OTHER" and elem.value in elem.my_types:
+                ref = elem.my_types[elem.value]
+                if ref._has_stream_iters():
+                    counts[elem.value] = counts.get(elem.value, 0) + 1
+                walk(ref)
 
             if elem.type in ["LIST", "MAP", "GROUP", "UNION"]:
                 for child in elem.value:
@@ -2965,8 +3087,59 @@ Generated with a --default-max-qty of {self.default_max_qty}"""
             if elem.key:
                 walk(elem.key)
 
+        walk(entry)
+        return counts
+
+    def collect_stream_iter_names_for_entry(self, entry):
+        if not self.stream_encode_functions:
+            return []
+
+        # First pass: identify types referenced from multiple fields.
+        multi_refs = set()
+        counts = self._count_iter_type_refs(entry)
+        for type_name, count in counts.items():
+            if count > 1:
+                multi_refs.add(type_name)
+
+        repeats = set()
+        visited = set()
+
+        def walk(elem, path_prefix=None):
+            visit_key = (id(elem), path_prefix)
+            if visit_key in visited:
+                return
+            visited.add(visit_key)
+
+            if elem.count_var_condition():
+                name = elem.var_name(with_prefix=True, observe_skipped=False)
+                if path_prefix:
+                    name = f"{path_prefix}_{name}"
+                repeats.add(name)
+
+            if elem.type in ["LIST", "MAP", "GROUP", "UNION"]:
+                for child in elem.value:
+                    walk(child, path_prefix)
+
+            if elem.cbor:
+                walk(elem.cbor, path_prefix)
+
+            if elem.key:
+                walk(elem.key, path_prefix)
+
             if elem.type == "OTHER" and elem.value in elem.my_types:
-                walk(elem.my_types[elem.value])
+                ref = elem.my_types[elem.value]
+                if elem.value in multi_refs:
+                    # Multi-referenced type: use the current OTHER element's field
+                    # name as the path prefix for disambiguation.
+                    new_prefix = elem.var_name(with_prefix=False, observe_skipped=False)
+                    walk(ref, new_prefix)
+                else:
+                    # Non-multi-ref type: reset prefix to None.  The path prefix
+                    # from a parent multi-ref type must NOT leak through to a
+                    # different named type — that type's encode function is
+                    # generated once (without context) and accesses the plain
+                    # iterator field name.
+                    walk(ref, None)
 
         walk(entry)
         return sorted(repeats)
@@ -3529,37 +3702,59 @@ typedef struct {struct_name} {struct_name};"""
         """Collect iterator field names for the whole schema (encode side only).
 
         These names are stable, unique (with_prefix=True), and map directly to the
-        var_name() used in generated encode code.
+        var_name() used in generated encode code.  For types referenced from multiple
+        fields, per-field-path names are produced (e.g. ``list_a_items_t_item_t_m``
+        instead of the single ``items_t_item_t_m``).
         """
         if not self.stream_encode_functions:
             return []
 
-        repeats = set()
+        # Compute multi-ref types across all entry types.
+        all_multi_refs = set()
+        for root in self.sorted_types["encode"]:
+            counts = self._count_iter_type_refs(root)
+            for type_name, count in counts.items():
+                if count > 1:
+                    all_multi_refs.add(type_name)
 
+        repeats = set()
         visited = set()
 
-        def walk(elem):
-            # Avoid infinite recursion on self-referential types.
-            if id(elem) in visited:
+        def walk(elem, path_prefix=None):
+            visit_key = (id(elem), path_prefix)
+            if visit_key in visited:
                 return
-            visited.add(id(elem))
+            visited.add(visit_key)
 
             if elem.count_var_condition():
-                repeats.add(elem.var_name(with_prefix=True, observe_skipped=False))
+                name = elem.var_name(with_prefix=True, observe_skipped=False)
+                if path_prefix:
+                    name = f"{path_prefix}_{name}"
+                repeats.add(name)
 
             if elem.type in ["LIST", "MAP", "GROUP", "UNION"]:
                 for child in elem.value:
-                    walk(child)
+                    walk(child, path_prefix)
 
             if elem.cbor:
-                walk(elem.cbor)
+                walk(elem.cbor, path_prefix)
 
             if elem.key:
-                walk(elem.key)
+                walk(elem.key, path_prefix)
 
             # Follow named types.
             if elem.type == "OTHER" and elem.value in elem.my_types:
-                walk(elem.my_types[elem.value])
+                ref = elem.my_types[elem.value]
+                if elem.value in all_multi_refs:
+                    new_prefix = elem.var_name(with_prefix=False, observe_skipped=False)
+                    walk(ref, new_prefix)
+                else:
+                    # Non-multi-ref type: reset prefix to None.  The path prefix
+                    # from a parent multi-ref type must NOT leak through to a
+                    # different named type — that type's encode function is
+                    # generated once (without context) and accesses the plain
+                    # iterator field name.
+                    walk(ref, None)
 
         # Walk from all top-level types; this makes the io struct schema-wide.
         for root in self.sorted_types["encode"]:

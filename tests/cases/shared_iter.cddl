@@ -1,0 +1,19 @@
+;
+; Copyright (c) 2025 Nordic Semiconductor ASA
+;
+; SPDX-License-Identifier: Apache-2.0
+;
+
+item_t = [
+    id: uint,
+    value: int,
+]
+
+items_t = [* item_t]
+
+container_t = [
+    name: tstr,
+    ? list_a: items_t,
+    ? list_b: items_t,
+    ? list_c: items_t,
+]
