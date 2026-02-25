@@ -1,0 +1,15 @@
+;
+; Copyright (c) 2025 Nordic Semiconductor ASA
+;
+; SPDX-License-Identifier: Apache-2.0
+;
+
+record_t = [
+    id: uint,
+    value: int,
+]
+
+collection_t = [
+    label: tstr,
+    records: [* record_t],
+]

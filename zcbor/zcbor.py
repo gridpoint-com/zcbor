@@ -2911,7 +2911,7 @@ class CodeGenerator(CddlXcoder):
                 )
                 has_prov = f"({prov_access} && {prov_access}->{prov_name}.next)"
                 iter_call = (
-                    f"zcbor_multi_encode_iter_minmax({self.min_qty}, {max_qty}, "
+                    f"zcbor_multi_encode_iter_minmax({self.min_qty}, SIZE_MAX, "
                     f"(zcbor_encoder_t *){func}, state, {prov_access}->{prov_name}.next, "
                     f"{prov_access}->{prov_name}.ctx)"
                 )
